@@ -1,0 +1,53 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.kyllan.plexamp",
+  "name": "Plexamp",
+  "version": "0.1.0",
+  "author": "kyllan",
+  "license": "MIT",
+  "description": "Stream music from your Plex library in the Omarchy bar: the cover of whatever is loaded sits in the bar, and a keyboard-driven dropdown carries a waveform scrubber, transport controls, and library browsing.",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Plexamp",
+    "description": "Plex music player with cover art and transport controls.",
+    "category": "Media",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "recentLimit": 40,
+      "hideWhenIdle": false,
+      "barArt": true
+    },
+    "schema": [
+      {
+        "key": "hideWhenIdle",
+        "type": "boolean",
+        "label": "Hide the widget when nothing is playing",
+        "defaultValue": false
+      },
+      {
+        "key": "barArt",
+        "type": "boolean",
+        "label": "Show the album cover in the bar while a track is loaded",
+        "defaultValue": true
+      },
+      {
+        "key": "recentLimit",
+        "type": "integer",
+        "label": "History entries to load",
+        "min": 10,
+        "max": 200,
+        "step": 10,
+        "defaultValue": 40
+      }
+    ]
+  }
+}

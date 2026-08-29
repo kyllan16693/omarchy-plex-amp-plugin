@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# Build a coarse loudness envelope for one track so the panel can draw a
+# Plexamp-style waveform seek bar.
+#
+# This server exposes no loudness ramps (that needs Plex's sonic analysis), so
+# we decode the stream ourselves. Decoding is cheap — a four-minute FLAC over
+# the LAN takes well under a second — and every result is cached by ratingKey,
+# so a track is only ever analysed once.
+#
+# Usage: plexamp-waveform <ratingKey>   # stream URL arrives on stdin
+#
+# The URL carries an X-Plex-Token, which is why it comes in over stdin instead
+# of argv: argv is world-readable through /proc.
+set -uo pipefail
+
+BUCKETS=120
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/plexamp/waveform"
+
+rating_key="${1:-}"
+[ -n "$rating_key" ] || { printf '%s\n' '{"stage":"error","message":"no rating key"}'; exit 1; }
+
+# ratingKeys are numeric; refuse anything that could escape the cache dir.
+case "$rating_key" in
+  *[!0-9]*|"") printf '%s\n' '{"stage":"error","message":"bad rating key"}'; exit 1 ;;
+esac
+
+cache="$STATE_DIR/$rating_key.json"
+
+emit_cached() {
+  if [ -s "$cache" ] && jq -e '.peaks | length > 0' "$cache" >/dev/null 2>&1; then
+    jq -c --arg k "$rating_key" '{stage:"waveform", ratingKey:$k, peaks:.peaks}' "$cache"
+    return 0
+  fi
+  return 1
+}
+
+emit_cached && exit 0
+
+IFS= read -r url || true
+[ -n "${url:-}" ] || { printf '%s\n' '{"stage":"error","message":"no stream url"}'; exit 1; }
+
+mkdir -p "$STATE_DIR" || true
+
+peaks="$(
+  timeout 90 nice -n 19 ffmpeg -v error -nostdin -i "$url" -ac 1 -ar 4000 -f s16le - 2>/dev/null \
+  | BUCKETS="$BUCKETS" python3 -c '
+import sys, os, struct, math, json
+
+raw = sys.stdin.buffer.read()
+count = len(raw) // 2
+if count < 64:
+    sys.exit(1)
+
+samples = struct.unpack("<%dh" % count, raw[:count * 2])
+buckets = int(os.environ.get("BUCKETS", "120"))
+
+rms = []
+for i in range(buckets):
+    chunk = samples[i * count // buckets:(i + 1) * count // buckets] or (0,)
+    rms.append(math.sqrt(sum(v * v for v in chunk) / len(chunk)) / 32768.0)
+
+# Stretch the envelope across the full height: modern masters sit in a narrow
+# loudness band, and the raw RMS would draw as a flat brick otherwise.
+ordered = sorted(rms)
+floor = ordered[int(0.05 * len(ordered))]
+ceiling = ordered[-1] or 1.0
+span = max(ceiling - floor, 1e-6)
+
+out = []
+for value in rms:
+    scaled = (max(0.0, value - floor) / span) ** 0.8
+    out.append(round(min(1.0, max(0.08, scaled)), 3))
+
+json.dump(out, sys.stdout, separators=(",", ":"))
+'
+)"
+
+if [ -z "$peaks" ]; then
+  printf '%s\n' "$(jq -nc --arg k "$rating_key" '{stage:"error",ratingKey:$k,message:"could not analyse track"}')"
+  exit 1
+fi
+
+tmp="$(mktemp "$STATE_DIR/.wave.XXXXXX")" || exit 1
+printf '{"peaks":%s}\n' "$peaks" > "$tmp"
+mv -f "$tmp" "$cache"
+
+printf '%s\n' "$(jq -nc --arg k "$rating_key" --argjson p "$peaks" '{stage:"waveform",ratingKey:$k,peaks:$p}')"

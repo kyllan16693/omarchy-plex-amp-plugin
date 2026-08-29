@@ -1,0 +1,190 @@
+#!/usr/bin/env bash
+# plexamp-auth — plex.tv PIN sign-in + server discovery for the Omarchy Plexamp plugin.
+#
+# Emits one JSON object per line on stdout so the QML panel can follow along:
+#   {"stage":"pin","code":"ABCD","url":"https://plex.tv/link","expires":1800}
+#   {"stage":"waiting"}
+#   {"stage":"token"}
+#   {"stage":"server","name":"...","uri":"..."}
+#   {"stage":"done"}
+#   {"stage":"error","message":"..."}
+#
+# The token is written to ~/.config/omarchy/plexamp/auth.json with mode 0600.
+
+set -uo pipefail
+umask 077
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plexamp"
+AUTH_FILE="$CONFIG_DIR/auth.json"
+ID_FILE="$CONFIG_DIR/client-id"
+
+PRODUCT="Omarchy Plexamp"
+VERSION="0.1.0"
+PLATFORM="Linux"
+DEVICE="Omarchy"
+
+mkdir -p "$CONFIG_DIR"
+
+emit() { printf '%s\n' "$1"; }
+fail() { emit "$(jq -nc --arg m "$1" '{stage:"error",message:$m}')"; exit 1; }
+
+for tool in curl jq; do
+  command -v "$tool" >/dev/null 2>&1 || fail "$tool is required but not installed"
+done
+
+# Stable per-install client identifier.
+if [[ ! -s "$ID_FILE" ]]; then
+  if command -v uuidgen >/dev/null 2>&1; then
+    uuidgen | tr 'A-Z' 'a-z' > "$ID_FILE"
+  else
+    head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$ID_FILE"
+  fi
+  chmod 600 "$ID_FILE"
+fi
+CLIENT_ID="$(tr -d '[:space:]' < "$ID_FILE")"
+[[ -n "$CLIENT_ID" ]] || fail "could not establish a client identifier"
+
+plex_headers=(
+  -H "Accept: application/json"
+  -H "X-Plex-Product: $PRODUCT"
+  -H "X-Plex-Version: $VERSION"
+  -H "X-Plex-Client-Identifier: $CLIENT_ID"
+  -H "X-Plex-Platform: $PLATFORM"
+  -H "X-Plex-Device: $DEVICE"
+  -H "X-Plex-Device-Name: $DEVICE"
+  -H "X-Plex-Model: hosted"
+)
+
+# ---------------------------------------------------------------- discovery --
+
+# Pick the best reachable connection for each music-capable server.
+# Prefers local, non-relay, https-when-available; verifies with /identity.
+probe_connections() {
+  local token="$1" resources server_json
+  resources="$(curl -sfL --max-time 20 "${plex_headers[@]}" \
+    -H "X-Plex-Token: $token" \
+    "https://plex.tv/api/v2/resources?includeHttps=1&includeRelay=1")" \
+    || fail "could not reach plex.tv to list your servers"
+
+  # Flatten to "<serverName>\t<accessToken>\t<uri>\t<local>\t<relay>", best-ordered.
+  server_json="$(printf '%s' "$resources" | jq -r '
+    [ .[]
+      | select(.provides != null and (.provides | contains("server")))
+      | . as $s
+      | ($s.connections // [])[]
+      | { name: $s.name,
+          token: ($s.accessToken // ""),
+          uri: .uri,
+          local: (.local // false),
+          relay: (.relay // false),
+          https: (.protocol == "https"),
+          owned: ($s.owned // false) }
+    ]
+    | sort_by([ (if .owned then 0 else 1 end),
+                (if .relay then 1 else 0 end),
+                (if .local then 0 else 1 end),
+                (if .https then 0 else 1 end) ])
+    | .[] | [.name, .token, .uri] | @tsv')" || fail "unexpected response from plex.tv"
+
+  [[ -n "$server_json" ]] || fail "no Plex Media Servers found on this account"
+
+  local name stoken uri machine
+  while IFS=$'\t' read -r name stoken uri; do
+    [[ -n "$uri" ]] || continue
+    [[ -n "$stoken" ]] || stoken="$token"
+    machine="$(curl -sfL --max-time 6 \
+      -H "Accept: application/json" \
+      -H "X-Plex-Token: $stoken" \
+      "$uri/identity" 2>/dev/null | jq -r '.MediaContainer.machineIdentifier // empty')"
+    if [[ -n "$machine" ]]; then
+      emit "$(jq -nc --arg n "$name" --arg u "$uri" '{stage:"server",name:$n,uri:$u}')"
+      write_auth "$token" "$stoken" "$uri" "$name" "$machine"
+      return 0
+    fi
+  done <<< "$server_json"
+
+  fail "found servers on your account but none were reachable from this machine"
+}
+
+write_auth() {
+  local account_token="$1" server_token="$2" uri="$3" name="$4" machine="$5" tmp
+  tmp="$(mktemp "$CONFIG_DIR/.auth.XXXXXX")"
+  jq -nc \
+    --arg at "$account_token" \
+    --arg st "$server_token" \
+    --arg uri "$uri" \
+    --arg name "$name" \
+    --arg machine "$machine" \
+    --arg cid "$CLIENT_ID" \
+    '{accountToken:$at, serverToken:$st, serverUri:$uri, serverName:$name,
+      machineIdentifier:$machine, clientIdentifier:$cid}' > "$tmp" || fail "could not write credentials"
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$AUTH_FILE"
+}
+
+# --------------------------------------------------------------------- main --
+
+case "${1:-login}" in
+  status)
+    if [[ -s "$AUTH_FILE" ]] && jq -e '.accountToken != "" and .serverUri != ""' "$AUTH_FILE" >/dev/null 2>&1; then
+      emit "$(jq -c '{stage:"done", serverName:.serverName, serverUri:.serverUri}' "$AUTH_FILE")"
+    else
+      emit '{"stage":"logged-out"}'
+    fi
+    exit 0
+    ;;
+
+  rediscover)
+    [[ -s "$AUTH_FILE" ]] || fail "not signed in"
+    token="$(jq -r '.accountToken // empty' "$AUTH_FILE")"
+    [[ -n "$token" ]] || fail "not signed in"
+    probe_connections "$token"
+    emit '{"stage":"done"}'
+    exit 0
+    ;;
+
+  logout)
+    rm -f "$AUTH_FILE"
+    emit '{"stage":"logged-out"}'
+    exit 0
+    ;;
+
+  login) ;;
+  *) fail "unknown command: $1" ;;
+esac
+
+pin_response="$(curl -sfL --max-time 20 -X POST "${plex_headers[@]}" \
+  "https://plex.tv/api/v2/pins")" || fail "could not reach plex.tv to start sign-in"
+
+pin_id="$(printf '%s' "$pin_response" | jq -r '.id // empty')"
+pin_code="$(printf '%s' "$pin_response" | jq -r '.code // empty')"
+expires_in="$(printf '%s' "$pin_response" | jq -r '.expiresIn // 900')"
+[[ -n "$pin_id" && -n "$pin_code" ]] || fail "plex.tv did not return a sign-in code"
+
+link_url="https://app.plex.tv/auth#?clientID=${CLIENT_ID}&code=${pin_code}"
+link_url+="&context%5Bdevice%5D%5Bproduct%5D=$(jq -rn --arg v "$PRODUCT" '$v|@uri')"
+
+emit "$(jq -nc --arg c "$pin_code" --arg u "$link_url" --argjson e "$expires_in" \
+  '{stage:"pin",code:$c,url:$u,expires:$e}')"
+
+if command -v xdg-open >/dev/null 2>&1; then
+  xdg-open "$link_url" >/dev/null 2>&1 &
+fi
+
+emit '{"stage":"waiting"}'
+
+deadline=$(( $(date +%s) + expires_in ))
+auth_token=""
+while (( $(date +%s) < deadline )); do
+  sleep 2
+  check="$(curl -sfL --max-time 10 "${plex_headers[@]}" \
+    "https://plex.tv/api/v2/pins/${pin_id}")" || continue
+  auth_token="$(printf '%s' "$check" | jq -r '.authToken // empty')"
+  [[ -n "$auth_token" ]] && break
+done
+
+[[ -n "$auth_token" ]] || fail "sign-in timed out — the code expired before it was linked"
+
+emit '{"stage":"token"}'
+probe_connections "$auth_token"
+emit '{"stage":"done"}'
