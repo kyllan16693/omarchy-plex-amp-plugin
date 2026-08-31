@@ -43,20 +43,22 @@ case "$url" in
   http://*|https://*) ;;
   *) printf '%s\n' '{"stage":"error","message":"bad stream url"}'; exit 1 ;;
 esac
+case "$url" in
+  *$'\r'*|*'"'*|*'\\'*)
+    # These have no reason to occur raw in a Plex URL (they should be percent
+    # encoded). Refusing them makes the one-line curl config unambiguous.
+    printf '%s\n' '{"stage":"error","message":"unsafe stream url"}'
+    exit 1
+    ;;
+esac
 
 umask 077
 mkdir -p "$STATE_DIR" || true
 chmod 700 "$STATE_DIR" 2>/dev/null || true
 
-# curl's config grammar accepts a quoted URL. Escape its two meaningful
-# characters so a malformed server response cannot add another curl option.
-curl_config_escape() {
-  sed 's/\\\\/\\\\\\\\/g; s/"/\\\\"/g'
-}
-
 request_config="$(mktemp "$STATE_DIR/.request.XXXXXX")" || exit 1
 trap 'rm -f "$request_config"' EXIT
-printf 'url = "%s"\n' "$(printf '%s' "$url" | curl_config_escape)" > "$request_config"
+printf 'url = "%s"\n' "$url" > "$request_config"
 
 peaks="$(
   timeout 90 curl -fsSL --config "$request_config" 2>/dev/null \

@@ -17,7 +17,7 @@ only do that on a network you trust.
 The plugin stores Plex account/server tokens and a client identifier in
 `~/.config/omarchy/plexamp/` with mode `0600`. Playback preferences, queue
 rating keys, and waveform caches live in `~/.local/state/omarchy/plexamp/`,
-whose directory is set to mode `0700`. Full stream and artwork URLs are not
+whose directory is set to mode `0700` and state file to `0600`. Full stream and artwork URLs are not
 written to state. A stream URL can contain a Plex token; it is retained only in
 the live player, passed to waveform analysis through a mode-`0600` temporary
 curl config, and removed as soon as that request ends. The mpv IPC socket lives

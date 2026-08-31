@@ -1387,6 +1387,7 @@ Item {
   property bool _stateRead: false
   property bool _playbackRestored: false
   property bool _playbackRestoring: false
+  property int _playbackRestoreAttempts: 0
   // Used to upgrade older state files that included token-bearing stream URLs.
   property var _pendingSanitizedPlayback: null
 
@@ -1489,7 +1490,20 @@ Item {
       })
     }, function () {
       root._playbackRestoring = false
+      if (root._playbackRestoreAttempts < 3) {
+        root._playbackRestoreAttempts++
+        restoreRetry.restart()
+      } else {
+        root.statusMessage = "Playback continued, but the queue could not be restored"
+      }
     })
+  }
+
+  Timer {
+    id: restoreRetry
+    interval: 1500
+    repeat: false
+    onTriggered: root.tryRestorePlayback()
   }
 
   function queueReferences(source) {
@@ -1531,8 +1545,15 @@ Item {
 
   function writeSanitizedSavedState() {
     if (!_stateLoaded || !_pendingSanitizedPlayback) return
-    stateFile.setText(stateDocument(_pendingSanitizedPlayback))
+    saveStateDocument(stateDocument(_pendingSanitizedPlayback))
     _pendingSanitizedPlayback = null
+  }
+
+  function saveStateDocument(document) {
+    stateFile.setText(document)
+    // FileView writes atomically; allow that write to land before tightening
+    // the file too. The 0700 parent already prevents other-user access.
+    stateFileModeTimer.restart()
   }
 
   function persistState() {
@@ -1550,7 +1571,7 @@ Item {
   }
 
   function writeState() {
-    stateFile.setText(stateDocument({
+    saveStateDocument(stateDocument({
       queue: queueReferences(root.queue),
       queueIndex: root.queueIndex,
       queueSource: root.queueSource,
@@ -1581,6 +1602,19 @@ Item {
       root._stateLoaded = true
       root.writeSanitizedSavedState()
     }
+  }
+
+  Timer {
+    id: stateFileModeTimer
+    interval: 100
+    repeat: false
+    onTriggered: stateFileModeProcess.running = true
+  }
+
+  Process {
+    id: stateFileModeProcess
+    running: false
+    command: ["chmod", "600", root.stateDir + "/state.json"]
   }
 
   Component.onCompleted: {
