@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build a coarse loudness envelope for one track so the panel can draw a
-# Plexamp-style waveform seek bar.
+# Ampbar waveform seek bar.
 #
 # This server exposes no loudness ramps (that needs Plex's sonic analysis), so
 # we decode the stream ourselves. Decoding is cheap — a four-minute FLAC over

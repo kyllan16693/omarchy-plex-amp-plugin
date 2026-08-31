@@ -8,15 +8,15 @@ import qs.Commons
 import qs.Ui
 import "PlexApi.js" as PlexApi
 
-// Bar widget + dropdown for the Plexamp plugin. All state lives in Service.qml;
+// Bar widget + dropdown for the Ampbar plugin. All state lives in Service.qml;
 // this file is the view and the keyboard state machine.
 Panel {
   id: root
-  moduleName: "io.github.kyllan.plexamp"
-  ipcTarget: "io.github.kyllan.plexamp"
+  moduleName: "io.github.kyllan.ampbar"
+  ipcTarget: "io.github.kyllan.ampbar"
   manageIpc: false
 
-  readonly property var plex: bar && bar.shell ? bar.shell.serviceFor("io.github.kyllan.plexamp") : null
+  readonly property var plex: bar && bar.shell ? bar.shell.serviceFor("io.github.kyllan.ampbar") : null
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
   readonly property color urgent: bar ? bar.urgent : Color.urgent
@@ -47,6 +47,21 @@ Panel {
   // controls you actually reach for when the panel is just a now-playing card.
   property bool mini: false
 
+  // A compact mini viewer starts with either no queue preview or one track.
+  // Its Up next header is always expandable, regardless of that preference.
+  readonly property bool miniQueueDefault: plex ? plex.pref("miniQueuePreview", false) === true : false
+  property bool miniQueueExpanded: false
+  onMiniChanged: if (mini) miniQueueExpanded = miniQueueDefault
+
+  readonly property var miniUpNext: {
+    if (!plex) return []
+    var all = plex.upNext
+    if (miniQueueExpanded) return all.slice(0, Math.min(all.length, 5))
+    return miniQueueDefault ? all.slice(0, 1) : []
+  }
+
+  property bool settingsOpen: false
+
   readonly property bool playing: plex ? plex.isPlaying : false
   readonly property bool hasTrack: plex ? plex.hasTrack : false
   readonly property var track: plex ? plex.currentTrack : null
@@ -56,8 +71,17 @@ Panel {
 
   // ------------------------------------------------------------ bar button
 
-  readonly property bool hideWhenIdle: setting("hideWhenIdle", false) === true
-  readonly property bool barArt: setting("barArt", true) !== false
+  // The settings window writes to the service's own prefs file, so that wins;
+  // the shell.json entry stays the fallback for anyone configuring the widget
+  // from the bar settings instead.
+  function option(name, fallback) {
+    var fromShell = setting(name, fallback)
+    return plex ? plex.pref(name, fromShell) : fromShell
+  }
+
+  readonly property bool hideWhenIdle: option("hideWhenIdle", false) === true
+  readonly property bool barArt: option("barArt", true) !== false
+  readonly property bool showHints: option("showHints", true) !== false
   visible: !hideWhenIdle || hasTrack
   implicitWidth: visible ? button.implicitWidth : 0
   implicitHeight: bar ? bar.barSize : Style.space(27)
@@ -82,14 +106,15 @@ Panel {
   // ------------------------------------------------------------------ tabs
 
   readonly property int tabHome: 0
-  readonly property int tabRadio: 1
-  readonly property int tabSearch: 2
+  readonly property int tabQueue: 1
+  readonly property int tabRadio: 2
+  readonly property int tabSearch: 3
   property int tab: tabHome
 
-  readonly property var tabNames: ["Home", "Radio", "Search"]
+  readonly property var tabNames: ["Home", "Next up", "Radio", "Search"]
 
   function setTab(index) {
-    var next = Math.max(0, Math.min(2, index))
+    var next = Math.max(0, Math.min(tabNames.length - 1, index))
     // Reaching for a tab means you want the library, so drop the mini viewer
     // even when the tab itself doesn't change.
     mini = false
@@ -106,8 +131,10 @@ Panel {
     else searchFocused = false
   }
 
+  // Wraps in both directions, so Tab off the end of Search lands back on Home.
   function cycleTab(direction) {
-    setTab((tab + (direction || 1) + 3) % 3)
+    var n = tabNames.length
+    setTab((tab + (direction || 1) + n) % n)
   }
 
   // --------------------------------------------------------- cursor model
@@ -159,7 +186,7 @@ Panel {
 
     if (tab === tabHome) {
       if (plex.homePlayed.length) {
-        pushHeader(out, "Recent plays")
+        pushHeader(out, "Most played this month")
         pushItems(out, plex.homePlayed)
       }
       if (plex.homeAdded.length) {
@@ -169,6 +196,20 @@ Panel {
       if (plex.history.length) {
         pushHeader(out, "History")
         pushItems(out, plex.history)
+      }
+      return out
+    }
+
+    if (tab === tabQueue) {
+      if (!plex.queue.length) return out
+      if (plex.currentTrack) {
+        pushHeader(out, "Now playing")
+        out.push({ kind: "track", item: plex.currentTrack, queueAt: plex.queueIndex })
+      }
+      if (plex.upNext.length) {
+        pushHeader(out, plex.queueTitle ? "Next up  ·  " + plex.queueTitle : "Next up")
+        for (var q = plex.queueIndex + 1; q < plex.queue.length; q++)
+          out.push({ kind: "track", item: plex.queue[q], queueAt: q })
       }
       return out
     }
@@ -275,7 +316,11 @@ Panel {
     if (!plex || !row) return
     var item = row.item
     if (!item) return
-    if (row.kind === "track") {
+    // Rows built from the live queue jump inside it instead of starting a
+    // fresh one, so picking "next up" keeps the rest of the queue intact.
+    if (row.queueAt !== undefined) {
+      plex.jumpTo(row.queueAt)
+    } else if (row.kind === "track") {
       plex.playQueue(row.list || [item], row.index || 0, "", "")
     } else if (row.kind === "album") {
       plex.playAlbum(item.ratingKey, item.title)
@@ -303,7 +348,7 @@ Panel {
     if (open) openRow(row); else activateRow(row)
   }
 
-  // `closeAtRoot` is what separates x/Backspace (which dismiss the panel once
+  // `closeAtRoot` is what separates Backspace (which dismisses the panel once
   // there is nothing left to back out of) from h, which just stops.
   function goBack(closeAtRoot) {
     if (!plex) return
@@ -320,6 +365,11 @@ Panel {
     }
   }
 
+  function openSettings() {
+    settingsOpen = true
+    root.close()
+  }
+
   function focusSearch() {
     searchFocused = true
     Qt.callLater(function () {
@@ -332,6 +382,24 @@ Panel {
   function tabFromSearch(direction) {
     cycleTab(direction)
     if (tab !== tabSearch) leaveSearch()
+  }
+
+  // Enter in the search field commits the query and hands the cursor to the
+  // results. Key autorepeat used to deliver a second Return to the panel a
+  // few milliseconds later, which opened whichever row the cursor had just
+  // landed on — the first artist, every time. This swallows that one.
+  property bool swallowReturn: false
+
+  Timer {
+    id: returnGuard
+    interval: 350
+    repeat: false
+    onTriggered: root.swallowReturn = false
+  }
+
+  function guardReturn() {
+    swallowReturn = true
+    returnGuard.restart()
   }
 
   function leaveSearch() {
@@ -362,11 +430,16 @@ Panel {
 
   IpcHandler {
     target: root.ipcTarget
-    function open(): void { root.open() }
-    function close(): void { root.close() }
-    function show(): void { root.open() }
-    function hide(): void { root.close() }
-    function toggle(): void { root.toggle() }
+    // close/hide also dismiss the settings window: it holds the keyboard
+    // exclusively, so "close the plugin" has to mean all of it.
+    function open(): void { root.settingsOpen = false; root.open() }
+    function close(): void { root.settingsOpen = false; root.close() }
+    function show(): void { root.settingsOpen = false; root.open() }
+    function hide(): void { root.settingsOpen = false; root.close() }
+    function toggle(): void {
+      if (root.settingsOpen) { root.settingsOpen = false; return }
+      root.toggle()
+    }
     function playPause(): string { if (root.plex) root.plex.playPause(); return "ok" }
     function next(): string { if (root.plex) root.plex.next(); return "ok" }
     function previous(): string { if (root.plex) root.plex.previous(); return "ok" }
@@ -386,6 +459,15 @@ Panel {
       root.mini = false
       root.plex.browseCurrentAlbum()
       if (!root.opened) root.open()
+      return "ok"
+    }
+    function queue(): string {
+      root.setTab(root.tabQueue)
+      root.open()
+      return "ok"
+    }
+    function settings(): string {
+      root.openSettings()
       return "ok"
     }
     function mini(): string {
@@ -413,8 +495,8 @@ Panel {
       Item {
         id: barIcon
 
-        // A loaded track wears its own cover in the bar. The Plex mark stands
-        // in for an idle player, and the bars cover the gap while the art is
+        // A loaded track wears its own cover in the bar. Ampbar's equalizer
+        // mark stands in for an idle player, and the bars cover the gap while the art is
         // still in flight (or when the server won't hand it over).
         readonly property string artSource:
           root.barArt && root.hasTrack && root.track ? (root.track.art || "") : ""
@@ -460,7 +542,7 @@ Panel {
           }
         }
 
-        PlexIcon {
+        AmpIcon {
           anchors.centerIn: parent
           width: Style.space(12)
           height: Style.space(12)
@@ -538,6 +620,11 @@ Panel {
       property bool sawReturn: false
       onReturnRequested: {
         sawReturn = true
+        // A Return left over from committing a search must not play a row.
+        if (root.swallowReturn) {
+          root.swallowReturn = false
+          return
+        }
         if (root.mini) {
           if (root.plex) root.plex.playPause()
           return
@@ -549,14 +636,19 @@ Panel {
         if (root.plex) root.plex.playPause()
       }
       onCloseRequested: root.close()
-      onDeleteRequested: root.goBack()
+      // PanelKeyCatcher maps x to delete. Nothing here deletes anything, and
+      // having x double as "back" alongside h only ever confused things.
+      onDeleteRequested: {}
       onTabRequested: function (direction) { root.cycleTab(direction) }
       onTextKey: function (t) {
         if (!root.plex) return
         switch (t) {
         case "1":                 root.setTab(root.tabHome); break
-        case "2":                 root.setTab(root.tabRadio); break
-        case "3": case "/":       root.setTab(root.tabSearch); break
+        case "2": case "u":       root.setTab(root.tabQueue); break
+        case "3":                 root.setTab(root.tabRadio); break
+        case "4": case "/":       root.setTab(root.tabSearch); break
+        case "c": case "C":       root.openSettings(); break
+        case "?":                 root.plex.setPref("showHints", !root.showHints); break
         case "p":                 root.plex.playPause(); break
         case "n":                 root.plex.next(); break
         case "b":                 root.plex.previous(); break
@@ -699,7 +791,7 @@ Panel {
           }
 
           Text {
-            text: "x  back"
+            text: "h  back"
             color: root.dimmer
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
@@ -850,7 +942,11 @@ Panel {
                     if (!rowItem.item) return ""
                     if (rowItem.isTrack)
                       return rowItem.item.artist + (rowItem.item.album ? "  ·  " + rowItem.item.album : "")
-                    return rowItem.item.artist || ""
+                    var label = rowItem.item.artist || ""
+                    if (rowItem.item.plays)
+                      label += (label ? "  ·  " : "") + rowItem.item.plays
+                        + (rowItem.item.plays === 1 ? " play" : " plays")
+                    return label
                   }
                   color: root.dimmer
                   font.family: root.fontFamily
@@ -910,6 +1006,7 @@ Panel {
                 return root.plex.searchQuery.length < 2
                   ? "Type to search your library"
                   : "Nothing matched “" + root.plex.searchQuery + "”"
+              if (root.tab === root.tabQueue) return "The queue is empty — play something first"
               if (root.tab === root.tabRadio) return "No stations on this library"
               if (root.plex.statusMessage) return root.plex.statusMessage
               return "Nothing here yet — press r to refresh"
@@ -924,11 +1021,11 @@ Panel {
 
         Text {
           Layout.fillWidth: true
-          visible: root.authState === "ready"
+          visible: root.authState === "ready" && root.showHints
           text: {
             if (root.searchFocused) return "↵ search   ↓ results   Esc back to list"
             if (root.browsing) return "jk move   l open   h back   ↵ play   space pause   n/b skip   ,. seek"
-            return "jk move   l open   h back   ↵ play   space pause   n/b skip   ,. seek   ± vol   / search   v mini"
+            return "jk move   l open   h back   ↵ play   space pause   n/b skip   ,. seek   / search   v mini   c settings"
           }
           color: root.dimmer
           font.family: root.fontFamily
@@ -964,7 +1061,7 @@ Panel {
             visible: status === Image.Ready
           }
 
-          PlexIcon {
+          AmpIcon {
             anchors.centerIn: parent
             width: Style.space(48)
             height: Style.space(48)
@@ -1049,16 +1146,169 @@ Panel {
           Item { Layout.fillWidth: true }
         }
 
+        // Volume sits under the transport, so the mini viewer is a complete
+        // player rather than a picture with three buttons.
+        RowLayout {
+          Layout.fillWidth: true
+          spacing: Style.space(6)
+
+          PanelActionButton {
+            iconText: root.plex && root.plex.muted ? "󰝟" : "󰕾"
+            tooltipText: "Mute (m)"
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            onClicked: if (root.plex) root.plex.toggleMute()
+          }
+
+          PanelSlider {
+            Layout.fillWidth: true
+            Layout.alignment: Qt.AlignVCenter
+            bar: root.bar
+            minimum: 0
+            maximum: 100
+            step: 5
+            integer: true
+            value: root.plex ? root.plex.volume : 0
+            onMoved: function (v) { if (root.plex) root.plex.setVolume(v) }
+            onReleased: function (v) { if (root.plex) root.plex.setVolume(v) }
+          }
+
+          PanelActionButton {
+            iconText: "󰒓"
+            tooltipText: "Settings (c)"
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            onClicked: root.openSettings()
+          }
+        }
+
+        // --------------------------------------------------------- up next --
+
+        // The setting chooses whether the collapsed mini viewer shows nothing
+        // or one track. The header always reveals more on demand.
+        Item {
+          Layout.fillWidth: true
+          Layout.preferredHeight: Style.space(18)
+          visible: root.plex && root.plex.upNext.length > 0
+
+          PanelSectionHeader {
+            anchors.left: parent.left
+            anchors.verticalCenter: parent.verticalCenter
+            text: "UP NEXT"
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+          }
+
+          Text {
+            anchors.right: parent.right
+            anchors.verticalCenter: parent.verticalCenter
+            text: (root.plex ? root.plex.upNext.length : 0)
+              + (root.miniQueueExpanded ? "  ⌃" : "  ⌄")
+            color: root.dimmer
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+
+          MouseArea {
+            anchors.fill: parent
+            cursorShape: Qt.PointingHandCursor
+            onClicked: root.miniQueueExpanded = !root.miniQueueExpanded
+          }
+        }
+
+        Repeater {
+          model: root.miniUpNext
+
+          delegate: Item {
+            id: upNextRow
+            required property int index
+            required property var modelData
+
+            Layout.fillWidth: true
+            Layout.preferredHeight: Style.space(28)
+
+            CursorSurface {
+              anchors.fill: parent
+              hasCursor: upNextMouse.containsMouse
+              foreground: root.foreground
+              accent: root.accent
+            }
+
+            RowLayout {
+              anchors.fill: parent
+              anchors.leftMargin: Style.space(6)
+              anchors.rightMargin: Style.space(6)
+              spacing: Style.space(8)
+
+              Rectangle {
+                Layout.preferredWidth: Style.space(20)
+                Layout.preferredHeight: Style.space(20)
+                Layout.alignment: Qt.AlignVCenter
+                radius: Style.cornerRadius
+                color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.08)
+                clip: true
+
+                Image {
+                  anchors.fill: parent
+                  source: upNextRow.modelData ? (upNextRow.modelData.art || "") : ""
+                  asynchronous: true
+                  cache: true
+                  fillMode: Image.PreserveAspectCrop
+                  sourceSize.width: Style.space(40)
+                  sourceSize.height: Style.space(40)
+                  visible: status === Image.Ready
+                }
+              }
+
+              Text {
+                Layout.fillWidth: true
+                text: upNextRow.modelData
+                  ? (upNextRow.modelData.title + "  ·  " + upNextRow.modelData.artist) : ""
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                elide: Text.ElideRight
+              }
+            }
+
+            MouseArea {
+              id: upNextMouse
+              anchors.fill: parent
+              hoverEnabled: true
+              cursorShape: Qt.PointingHandCursor
+              onClicked: if (root.plex) root.plex.jumpTo(root.plex.queueIndex + 1 + upNextRow.index)
+            }
+          }
+        }
+
         Text {
           Layout.fillWidth: true
+          visible: root.showHints
           horizontalAlignment: Text.AlignHCenter
-          text: "h back   ,. seek   space play/pause   n/b skip"
+          text: "h back   ,. seek   space play/pause   n/b skip   u queue"
+          wrapMode: Text.WordWrap
+          maximumLineCount: 2
           color: root.dimmer
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
         }
       }
     }
+  }
+
+  // Its own layer-shell surface: the dropdown is anchored under the bar
+  // button and sized to the list, which is the wrong shape for a settings
+  // form. Opening it closes the dropdown so only one surface holds the
+  // keyboard at a time.
+  PlexSettings {
+    plex: root.plex
+    anchorItem: button
+    open: root.settingsOpen
+    foreground: root.foreground
+    accent: root.accent
+    urgent: root.urgent
+    fontFamily: root.fontFamily
+    onCloseRequested: root.settingsOpen = false
   }
 
   // ============================================================ components
@@ -1081,6 +1331,9 @@ Panel {
       onAccepted: {
         searchDebounce.stop()
         if (root.plex) root.plex.search(text)
+        // Hand the cursor to the results, but not to whatever Return arrives
+        // next: autorepeat would otherwise open the first artist outright.
+        root.guardReturn()
         root.leaveSearch()
       }
       Keys.onEscapePressed: root.leaveSearch()
@@ -1107,7 +1360,7 @@ Panel {
 
       PanelHero {
         Layout.fillWidth: true
-        title: "Plexamp"
+        title: "Ampbar for Plex"
         meta: {
           switch (root.authState) {
           case "linking": return "Waiting for you to link this device…"
@@ -1118,7 +1371,7 @@ Panel {
         foreground: root.foreground
         fontFamily: root.fontFamily
         iconComponent: Component {
-          PlexIcon {
+          AmpIcon {
             width: Style.font.display
             height: Style.font.display
             color: root.authState === "error" ? root.urgent : root.foreground
@@ -1200,7 +1453,7 @@ Panel {
         Layout.fillWidth: true
         spacing: Style.space(12)
 
-        // Cover art, or the Plex mark when nothing is loaded.
+        // Cover art, or Ampbar's own mark when nothing is loaded.
         Rectangle {
           Layout.preferredWidth: Style.space(64)
           Layout.preferredHeight: Style.space(64)
@@ -1219,7 +1472,7 @@ Panel {
             visible: status === Image.Ready
           }
 
-          PlexIcon {
+          AmpIcon {
             anchors.centerIn: parent
             width: Style.space(24)
             height: Style.space(24)
@@ -1228,7 +1481,7 @@ Panel {
           }
 
           // Clicking the art swaps to the mini viewer, like tapping the
-          // artwork in the Plexamp app.
+          // artwork in a music player.
           MouseArea {
             anchors.fill: parent
             enabled: root.hasTrack
@@ -1358,6 +1611,14 @@ Panel {
         }
 
         Item { Layout.preferredWidth: Style.space(6) }
+
+        PanelActionButton {
+          iconText: "󰒓"
+          tooltipText: "Settings (c)"
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          onClicked: root.openSettings()
+        }
 
         PanelActionButton {
           iconText: root.plex && root.plex.muted ? "󰝟" : "󰕾"

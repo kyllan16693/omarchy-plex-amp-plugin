@@ -69,8 +69,8 @@ PanelWindow {
 
   // --- album tinting ------------------------------------------------------
   //
-  // Plex ships a four-corner palette per album (UltraBlurColors), which is
-  // exactly what the Plexamp app paints behind the player. `tinted` false
+  // Plex exposes a four-corner palette per album (UltraBlurColors), which is
+  // suitable for tinting the player. `tinted` false
   // falls back to the theme's popup background.
   property bool tinted: false
   property color cardColor: Color.popups.background

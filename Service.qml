@@ -3,7 +3,7 @@ import Quickshell
 import Quickshell.Io
 import "PlexApi.js" as PlexApi
 
-// Plexamp service: owns the Plex session, the play queue, and the headless mpv
+// Ampbar service: owns the Plex session, the play queue, and the headless mpv
 // process that actually makes sound. The bar widget is a pure view over this.
 Item {
   id: root
@@ -19,9 +19,13 @@ Item {
   readonly property string pluginDir: manifest && manifest.__sourceDir ? String(manifest.__sourceDir) : ""
   readonly property string authScript: pluginDir ? pluginDir + "/bin/plexamp-auth" : ""
   readonly property string waveScript: pluginDir ? pluginDir + "/bin/plexamp-waveform" : ""
+  readonly property string engineScript: pluginDir ? pluginDir + "/bin/plexamp-engine" : ""
   readonly property string configDir: (Quickshell.env("XDG_CONFIG_HOME") || (home + "/.config")) + "/omarchy/plexamp"
   readonly property string stateDir: (Quickshell.env("XDG_STATE_HOME") || (home + "/.local/state")) + "/omarchy/plexamp"
-  readonly property string socketPath: (Quickshell.env("XDG_RUNTIME_DIR") || "/tmp") + "/omarchy-plexamp.sock"
+  // Omarchy supplies a per-user runtime directory. Avoid /tmp: an IPC socket
+  // there would be globally predictable and weaker than the 0700 runtime dir.
+  readonly property string runtimeDir: Quickshell.env("XDG_RUNTIME_DIR") || ""
+  readonly property string socketPath: runtimeDir ? runtimeDir + "/omarchy-ampbar.sock" : ""
 
   // ---------------------------------------------------------------- session
 
@@ -77,6 +81,14 @@ Item {
   readonly property bool canNext: queueIndex >= 0 && queueIndex < queue.length - 1
   readonly property bool canPrevious: queueIndex > 0
 
+  // Everything the queue still has to play, in order. The Next up tab and the
+  // mini viewer's up-next strip both read this.
+  readonly property var upNext: {
+    var out = []
+    for (var i = queueIndex + 1; i < queue.length; i++) out.push(queue[i])
+    return out
+  }
+
   // ---------------------------------------------------------------- library
 
   property bool loading: false
@@ -92,10 +104,12 @@ Item {
     return ""
   }
 
-  property int homeLimit: 12
+  // The first two Home sections deliberately stay compact. History has its
+  // own configurable depth below them.
+  property int homeLimit: 5
   property int historyLimit: 40
 
-  property var homePlayed: []      // recently played albums
+  property var homePlayed: []      // most-played albums (or radio fallbacks) this month
   property var homeAdded: []       // recently added albums
   property var history: []         // recently played tracks, newest first
   property var stations: []        // server-generated radio stations
@@ -105,7 +119,7 @@ Item {
   property string browseTitle: ""
   property var browseTracks: []
   property var browseAlbums: []
-  // Artist view, split the way the Plexamp artist page splits it:
+  // Artist view, split into albums / singles & EPs / everything else:
   // [{ title, items }] for albums / singles & EPs / everything else.
   property var browseGroups: []
 
@@ -118,6 +132,26 @@ Item {
   property var searchArtists: []
   readonly property bool searchEmpty: searchTracks.length === 0
     && searchAlbums.length === 0 && searchArtists.length === 0
+
+  // ------------------------------------------------------------ preferences
+
+  // Options the settings window can change. They live in the plugin's own
+  // state file rather than shell.json, because a plugin cannot safely rewrite
+  // the shell config from underneath the shell.
+  property var prefs: ({})
+
+  function pref(name, fallback) {
+    var value = prefs ? prefs[name] : undefined
+    return value === undefined || value === null ? fallback : value
+  }
+
+  function setPref(name, value) {
+    var next = {}
+    for (var k in prefs) next[k] = prefs[k]
+    next[name] = value
+    prefs = next
+    persistState()
+  }
 
   signal browseLoaded()
   signal searchLoaded()
@@ -184,8 +218,13 @@ Item {
 
   function logout() {
     stop()
+    shutdownEngine()
     queue = []
     queueIndex = -1
+    queueSource = ""
+    queueTitle = ""
+    playQueueId = 0
+    persistPlayback()
     homePlayed = []
     homeAdded = []
     history = []
@@ -198,6 +237,57 @@ Item {
     if (!authScript) return
     logoutProcess.command = [authScript, "logout"]
     logoutProcess.running = true
+  }
+
+  // True while plexamp-auth is re-pointing us at a server. The settings window
+  // shows it so the user knows the address is being probed, not ignored.
+  property bool serverBusy: false
+
+  // Point the plugin at a specific address. Discovery normally picks one, but
+  // it favours the connection plex.tv advertises, which is not always the one
+  // that works from this machine.
+  function setServer(uri) {
+    var target = String(uri || "").trim()
+    if (!authScript || serverProcess.running || !target) return
+    serverBusy = true
+    authError = ""
+    serverProcess.command = [authScript, "server", target]
+    serverProcess.running = true
+  }
+
+  function rediscoverServer() {
+    if (!authScript || serverProcess.running) return
+    serverBusy = true
+    authError = ""
+    serverProcess.command = [authScript, "rediscover"]
+    serverProcess.running = true
+  }
+
+  Process {
+    id: serverProcess
+    running: false
+    stdout: SplitParser {
+      splitMarker: "\n"
+      onRead: function (line) {
+        var trimmed = String(line || "").trim()
+        if (!trimmed) return
+        var msg = null
+        try {
+          msg = JSON.parse(trimmed)
+        } catch (e) {
+          return
+        }
+        if (!msg) return
+        if (String(msg.stage || "") === "error")
+          root.authError = String(msg.message || "could not reach that server")
+      }
+    }
+    onExited: {
+      root.serverBusy = false
+      // write_auth swaps the file in by rename, which the watcher can miss.
+      authFile.reload()
+      if (root.ready) root.refreshLibrary()
+    }
   }
 
   function cancelLogin() {
@@ -408,22 +498,29 @@ Item {
   }
 
   function loadHome() {
-    loadRecentlyPlayed()
+    loadMostPlayedThisMonth()
     loadRecentlyAdded()
     loadHistory()
   }
 
-  function loadRecentlyPlayed() {
+  function loadMostPlayedThisMonth() {
     if (!ready || !musicSectionKey) return
     loading = true
-    request("/library/sections/" + musicSectionKey + "/all", {
-      "type": 9,
-      "sort": "lastViewedAt:desc",
-      "lastViewedAt>>": 0,
+    var today = new Date()
+    // Plex timestamps are Unix seconds. Asking the server for the month keeps
+    // a long listening history from dominating the result; the parser applies
+    // the same boundary as a guard for older servers that ignore this filter.
+    var monthStart = Math.floor(new Date(today.getFullYear(), today.getMonth(), 1).getTime() / 1000)
+    request("/status/sessions/history/all", {
+      "sort": "viewedAt:desc",
+      "librarySectionID": musicSectionKey,
+      "viewedAt>>": monthStart,
       "X-Plex-Container-Start": 0,
-      "X-Plex-Container-Size": homeLimit
+      "X-Plex-Container-Size": 500
     }, function (response) {
-      root.homePlayed = PlexApi.albums(root.serverUri, root.serverToken, response)
+      var entries = PlexApi.historyEntries(response)
+      root.homePlayed = PlexApi.mostPlayedThisMonth(root.serverUri, root.serverToken,
+                                                     entries, monthStart, root.homeLimit)
       root.loading = false
     }, function (error) {
       root.loading = false
@@ -689,6 +786,7 @@ Item {
       }
       root.queue = items
       root.queueIndex = Math.max(0, Math.min(at, items.length - 1))
+      root.persistPlayback()
       // The tail we just pulled in is what mpv should be prefetching.
       root.queueNext()
     }, function () {
@@ -831,45 +929,30 @@ Item {
 
   // ============================================================== mpv engine
 
+  // This helper only *starts* mpv. The player itself is detached by
+  // plexamp-engine so a Quickshell reload cannot take down playback.
   Process {
-    id: mpv
+    id: engineProcess
     running: false
-    command: ["bash", "-c",
-      "rm -f \"$1\"; exec mpv --no-video --idle=yes --no-terminal --really-quiet "
-      + "--audio-display=no --gapless-audio=yes --keep-open=no "
-      + "--cache=yes --prefetch-playlist=yes "
-      + "--volume=\"$2\" --input-ipc-server=\"$1\"",
-      "plexamp", root.socketPath, String(root.volume)]
-
-    stderr: SplitParser {
-      splitMarker: "\n"
-      onRead: function (line) {
-        if (String(line || "").trim() !== "") console.warn("plexamp/mpv:", line)
-      }
-    }
-
     onStarted: connectTimer.restart()
-    onExited: function (code) {
-      root.isPlaying = false
-      ipc.connected = false
-      positionTimer.stop()
-      if (root._wantEngine) connectTimer.restart()
-    }
+    onExited: if (root._wantEngine) connectTimer.restart()
   }
 
   property bool _wantEngine: false
 
   function ensureEngine() {
     _wantEngine = true
-    if (!mpv.running) {
-      mpv.running = true
+    if (ipc.connected) return true
+    if (!socketPath) {
+      playbackError = "XDG_RUNTIME_DIR is unavailable; cannot start mpv"
       return false
     }
-    if (!ipc.connected) {
-      connectTimer.restart()
-      return false
+    if (!engineProcess.running && engineScript) {
+      engineProcess.command = [engineScript, "start", root.socketPath, String(root.volume)]
+      engineProcess.running = true
     }
-    return true
+    connectTimer.restart()
+    return false
   }
 
   Timer {
@@ -884,14 +967,10 @@ Item {
         stop()
         return
       }
-      if (!mpv.running) {
-        if (root._wantEngine) mpv.running = true
-        return
-      }
       attempts++
       if (attempts > 50) {
         stop()
-        root.playbackError = "mpv did not start"
+        root.playbackError = "could not connect to mpv"
         return
       }
       ipc.connected = true
@@ -911,9 +990,8 @@ Item {
         root.playbackError = ""
         root.observeProperties()
         root.flushPending()
+        root.tryRestorePlayback()
       } else if (root._wantEngine) {
-        root.isPlaying = false
-        positionTimer.stop()
         connectTimer.restart()
       }
     }
@@ -1036,6 +1114,7 @@ Item {
         advanceGuard.stop()
         if (canNext) {
           queueIndex = queueIndex + 1
+          persistPlayback()
           trackStarted()
         }
       }
@@ -1062,6 +1141,7 @@ Item {
     queueSource = source || ""
     queueTitle = title || ""
     if (queueSource !== "radio") playQueueId = 0
+    persistPlayback()
     loadCurrent()
   }
 
@@ -1135,6 +1215,7 @@ Item {
   function advance() {
     if (canNext) {
       queueIndex = queueIndex + 1
+      persistPlayback()
       loadCurrent()
     } else {
       isPlaying = false
@@ -1181,6 +1262,25 @@ Item {
       return
     }
     queueIndex = queueIndex + 1
+    persistPlayback()
+    loadCurrent()
+  }
+
+  // Play a specific entry of the current queue. Only the entry right after the
+  // current one is ever prefetched, so anything further along has to be loaded
+  // the ordinary way.
+  function jumpTo(index) {
+    if (index < 0 || index >= queue.length) return
+    if (index === queueIndex) {
+      seek(0)
+      return
+    }
+    if (index === queueIndex + 1) {
+      next()
+      return
+    }
+    queueIndex = index
+    persistPlayback()
     loadCurrent()
   }
 
@@ -1192,6 +1292,7 @@ Item {
     }
     if (canPrevious) {
       queueIndex = queueIndex - 1
+      persistPlayback()
       loadCurrent()
     } else {
       seek(0)
@@ -1206,6 +1307,16 @@ Item {
     advanceGuard.stop()
     if (ipc.connected) sendCommand(["stop"])
     reportProgress("stopped")
+  }
+
+  // A regular shell refresh deliberately leaves mpv alone. Signing out is a
+  // different lifecycle boundary: close the detached player and its IPC socket
+  // so it cannot keep a stream URL/token-bearing playlist in memory.
+  function shutdownEngine() {
+    _wantEngine = false
+    connectTimer.stop()
+    _pending = []
+    if (ipc.connected) sendCommand(["quit"])
   }
 
   function seek(seconds) {
@@ -1258,6 +1369,9 @@ Item {
   // ================================================================== state
 
   property string _savedSectionKey: ""
+  property var _savedPlayback: null
+  property bool _stateRead: false
+  property bool _playbackRestored: false
 
   FileView {
     id: stateFile
@@ -1271,27 +1385,97 @@ Item {
         if (data && typeof data.volume === "number")
           root.volume = Math.max(0, Math.min(100, Math.round(data.volume)))
         if (data && data.sectionKey) root._savedSectionKey = String(data.sectionKey)
+        if (data && data.prefs && typeof data.prefs === "object") root.prefs = data.prefs
+        if (data && data.playback && Array.isArray(data.playback.queue))
+          root._savedPlayback = data.playback
       } catch (e) {
         // A missing or corrupt state file just means defaults.
       }
+      root._stateRead = true
+      root.tryRestorePlayback()
+    }
+    onLoadFailed: {
+      root._stateRead = true
+      root.tryRestorePlayback()
     }
   }
 
   property bool _stateLoaded: false
+
+  // The QML service is replaceable, but mpv is not: when a new service comes
+  // up after a shell refresh it reconnects to the old IPC socket, restores the
+  // queue description for the UI, and asks mpv for the actual playback time.
+  // It never calls loadCurrent() here, which is what preserves the song and
+  // its exact position.
+  function tryRestorePlayback() {
+    if (_playbackRestored || !_stateRead || !ipc.connected || !_savedPlayback)
+      return
+    var saved = _savedPlayback
+    if (!saved.queue || !saved.queue.length) {
+      _playbackRestored = true
+      return
+    }
+    var restored = []
+    for (var i = 0; i < saved.queue.length; i++) {
+      var track = saved.queue[i]
+      if (track && track.ratingKey && track.stream) restored.push(track)
+    }
+    if (!restored.length) {
+      _playbackRestored = true
+      return
+    }
+    queue = restored
+    queueIndex = Math.max(0, Math.min(Number(saved.queueIndex || 0), restored.length - 1))
+    queueSource = String(saved.queueSource || "")
+    queueTitle = String(saved.queueTitle || "")
+    playQueueId = Number(saved.playQueueId || 0)
+    duration = currentTrack ? Number(currentTrack.duration || 0) : 0
+    _playbackRestored = true
+    requestWaveform()
+    requestTint()
+    sendCommand(["get_property", "pause"], function (value) {
+      isPlaying = hasTrack && value === false
+      if (isPlaying) positionTimer.restart()
+    })
+    sendCommand(["get_property", "time-pos"], function (value) {
+      if (typeof value === "number") position = value
+    })
+  }
 
   function persistState() {
     if (!_stateLoaded) return
     persistTimer.restart()
   }
 
+  // Queue changes are written immediately. If the shell is refreshed right
+  // after a skip or a new play request, the replacement service still has the
+  // metadata needed to reconnect to the already-playing mpv instance.
+  function persistPlayback() {
+    if (!_stateLoaded) return
+    persistTimer.stop()
+    writeState()
+  }
+
+  function writeState() {
+    stateFile.setText(JSON.stringify({
+      volume: root.volume,
+      sectionKey: root.musicSectionKey,
+      prefs: root.prefs,
+      playback: {
+        queue: root.queue,
+        queueIndex: root.queueIndex,
+        queueSource: root.queueSource,
+        queueTitle: root.queueTitle,
+        playQueueId: root.playQueueId
+      }
+    }, null, 2) + "\n")
+  }
+
   Timer {
     id: persistTimer
     interval: 800
     repeat: false
-    onTriggered: stateFile.setText(JSON.stringify({
-      volume: root.volume,
-      sectionKey: root.musicSectionKey
-    }, null, 2) + "\n")
+    onTriggered: root.writeState()
   }
 
   Process {
@@ -1305,11 +1489,12 @@ Item {
     mkdirProcess.running = true
     stateFile.reload()
     authFile.reload()
+    ensureEngine()
   }
 
   Component.onDestruction: {
-    _wantEngine = false
-    if (mpv.running) mpv.signal(15)
+    // mpv intentionally outlives this QML object, including shell refreshes.
+    // Playback can be stopped explicitly through the normal transport APIs.
     if (waveProcess.running) waveProcess.signal(15)
   }
 }

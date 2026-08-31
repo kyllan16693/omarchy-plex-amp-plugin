@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# Start a deliberately detached mpv. Quickshell destroys child Process objects
+# during a shell/plugin reload; a separate session lets audio keep running and
+# lets the replacement Service.qml reconnect to the same IPC socket.
+set -euo pipefail
+
+action="${1:-start}"
+socket="${2:?missing mpv socket path}"
+volume="${3:-70}"
+runtime_dir="${XDG_RUNTIME_DIR:?XDG_RUNTIME_DIR is required}"
+
+case "$socket" in
+  "$runtime_dir"/*) ;;
+  *)
+    echo "refusing IPC socket outside XDG_RUNTIME_DIR" >&2
+    exit 2
+    ;;
+esac
+
+case "$action" in
+  start)
+    # A live socket means a previous shell instance already owns the player.
+    # Do not remove it: that is the normal hot-reload path.
+    if [[ -S "$socket" ]]; then
+      if python3 - "$socket" <<'PY'
+import socket
+import sys
+
+client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+client.settimeout(0.2)
+try:
+    client.connect(sys.argv[1])
+except OSError:
+    raise SystemExit(1)
+finally:
+    client.close()
+PY
+      then
+        exit 0
+      fi
+    fi
+    rm -f "$socket"
+    # setsid gives mpv a new session, so it is not terminated with the short
+    # lived QML Process that invoked this helper. mpv owns the socket lifetime.
+    setsid mpv --no-video --idle=yes --no-terminal --really-quiet \
+      --audio-display=no --gapless-audio=yes --keep-open=no \
+      --cache=yes --prefetch-playlist=yes --volume="$volume" \
+      --input-ipc-server="$socket" </dev/null >/dev/null 2>&1 &
+    ;;
+  stop)
+    # Prefer graceful shutdown through the IPC client in Service.qml. This
+    # fallback only clears a stale socket left after an unclean exit.
+    [[ -S "$socket" ]] || rm -f "$socket"
+    ;;
+  *)
+    echo "usage: plexamp-engine {start|stop} SOCKET [VOLUME]" >&2
+    exit 2
+    ;;
+esac

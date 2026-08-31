@@ -1,6 +1,6 @@
 import QtQuick
 
-// Plexamp-style waveform scrubber: a mirrored loudness envelope where the
+// Mirrored waveform scrubber: a mirrored loudness envelope where the
 // played part is drawn in the accent colour and the rest sits dim behind it.
 //
 // The two canvases paint the same bars in different colours; only the clip in

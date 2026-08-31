@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# plexamp-auth — plex.tv PIN sign-in + server discovery for the Omarchy Plexamp plugin.
+# plexamp-auth — plex.tv PIN sign-in + server discovery for Ampbar for Plex.
 #
 # Emits one JSON object per line on stdout so the QML panel can follow along:
 #   {"stage":"pin","code":"ABCD","url":"https://plex.tv/link","expires":1800}
@@ -8,6 +8,8 @@
 #   {"stage":"server","name":"...","uri":"..."}
 #   {"stage":"done"}
 #   {"stage":"error","message":"..."}
+#
+# Subcommands: login | status | rediscover | server <address> | logout
 #
 # The token is written to ~/.config/omarchy/plexamp/auth.json with mode 0600.
 
@@ -18,7 +20,7 @@ CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plexamp"
 AUTH_FILE="$CONFIG_DIR/auth.json"
 ID_FILE="$CONFIG_DIR/client-id"
 
-PRODUCT="Omarchy Plexamp"
+PRODUCT="Ampbar for Plex"
 VERSION="0.1.0"
 PLATFORM="Linux"
 DEVICE="Omarchy"
@@ -106,6 +108,20 @@ probe_connections() {
   fail "found servers on your account but none were reachable from this machine"
 }
 
+# Turn whatever the settings window was given ("192.168.1.55", "host:32400",
+# "https://host:32400/") into something the server will actually answer on.
+normalize_uri() {
+  local raw="$1" hostport
+  raw="$(printf '%s' "$raw" | tr -d '[:space:]')"
+  [[ "$raw" == *"://"* ]] || raw="http://$raw"
+  raw="${raw%/}"
+  hostport="${raw#*://}"
+  hostport="${hostport%%/*}"
+  # A bare host means the default Plex port.
+  [[ "$hostport" == *:* ]] || raw="$raw:32400"
+  printf '%s' "$raw"
+}
+
 write_auth() {
   local account_token="$1" server_token="$2" uri="$3" name="$4" machine="$5" tmp
   tmp="$(mktemp "$CONFIG_DIR/.auth.XXXXXX")"
@@ -141,6 +157,35 @@ case "${1:-login}" in
     probe_connections "$token"
     emit '{"stage":"done"}'
     exit 0
+    ;;
+
+  server)
+    # Pin the plugin to a specific address instead of whatever discovery
+    # picked. The address comes in on argv, which is safe because it carries
+    # no token -- the tokens stay in auth.json and are only ever read here.
+    [[ -n "${2:-}" ]] || fail "no server address given"
+    [[ -s "$AUTH_FILE" ]] || fail "not signed in"
+    account="$(jq -r '.accountToken // empty' "$AUTH_FILE")"
+    stored="$(jq -r '.serverToken // empty' "$AUTH_FILE")"
+    name="$(jq -r '.serverName // "Plex"' "$AUTH_FILE")"
+    [[ -n "$account$stored" ]] || fail "not signed in"
+
+    uri="$(normalize_uri "$2")"
+    # The server token is scoped to one server, so fall back to the account
+    # token when the new address turns out to be a different machine.
+    for tok in "$stored" "$account"; do
+      [[ -n "$tok" ]] || continue
+      machine="$(curl -sfL --max-time 8 \
+        -H "Accept: application/json" \
+        -H "X-Plex-Token: $tok" \
+        "$uri/identity" 2>/dev/null | jq -r '.MediaContainer.machineIdentifier // empty')"
+      [[ -n "$machine" ]] || continue
+      write_auth "$account" "$tok" "$uri" "$name" "$machine"
+      emit "$(jq -nc --arg n "$name" --arg u "$uri" '{stage:"server",name:$n,uri:$u}')"
+      emit '{"stage":"done"}'
+      exit 0
+    done
+    fail "no Plex server answered at $uri"
     ;;
 
   logout)

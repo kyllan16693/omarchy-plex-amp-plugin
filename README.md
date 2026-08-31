@@ -1,18 +1,24 @@
-# Plexamp for Omarchy
+# Ampbar for Plex
 
-A Plex music player that lives in the Omarchy bar. The cover of whatever is
+An independent Plex music player that lives in the Omarchy bar. The cover of whatever is
 loaded sits in the bar, dimming while paused; pressing it (or a keybind) drops
 down a keyboard-driven panel with cover art, a waveform scrubber, transport
-controls, and three tabs — Home, Radio and Search.
+controls, and four tabs — Home, Next up, Radio and Search.
 
 The panel takes on the colours of whatever is playing, using the same
-four-corner album palette (`UltraBlurColors`) the Plexamp app paints with, and
+four-corner album palette (`UltraBlurColors`) exposed by Plex, and
 clicking the cover art swaps to a mini viewer: art as large as it goes, plus
-seek and skip.
+seek, skip, volume and what's queued next.
 
-The plugin *is* the player — it talks to the Plex API for your library and stream
-URLs, then plays them through a headless `mpv` it controls over an IPC socket.
-Plexamp itself is not required or used.
+The plugin *is* the player — it talks to the Plex Media Server API for your
+library and stream URLs, then plays them through a headless `mpv` it controls
+over an IPC socket. The official Plexamp application is not required or used.
+The previews below are illustrative UI mockups; they do not contain a user's
+library or account data.
+
+![Ampbar home and now-playing panel](assets/screenshots/home.png)
+
+![Ampbar mini player](assets/screenshots/mini-player.png)
 
 ## Requirements
 
@@ -23,12 +29,24 @@ Plexamp itself is not required or used.
 ## Install
 
 ```sh
-./install.sh
+omarchy plugin add https://github.com/kyllan/ampbar-for-plex-omarchy.git --enable
 ```
 
-That copies the plugin to `~/.config/omarchy/plugins/io.github.kyllan.plexamp/`,
-validates it, rescans, and enables it. Add the **Plexamp** widget to your bar from
+Omarchy clones, validates, and enables the plugin. Add the **Ampbar for Plex** widget to your bar from
 the bar settings if it doesn't appear on its own.
+
+For a local development checkout, `./install.sh` copies the current directory
+to `~/.config/omarchy/plugins/io.github.kyllan.ampbar/`, validates it, rescans,
+and enables it.
+
+## Remove
+
+```sh
+omarchy plugin remove io.github.kyllan.ampbar
+```
+
+Sign out first if you want the credential file removed. See [Privacy](PRIVACY.md)
+for the optional local-state cleanup paths.
 
 ## Sign in
 
@@ -41,17 +59,23 @@ Credentials are written by `bin/plexamp-auth` to
 `~/.config/omarchy/plexamp/auth.json` with mode `0600`. Nothing is written from
 QML, and the token never leaves your machine except to talk to Plex.
 
-Sign out with `O` (capital) in the panel, or:
+Sign out from the settings window (`c`), with `O` (capital) in the panel, or:
 
 ```sh
-~/.config/omarchy/plugins/io.github.kyllan.plexamp/bin/plexamp-auth logout
+~/.config/omarchy/plugins/io.github.kyllan.ampbar/bin/plexamp-auth logout
 ```
 
-If your server moves (new IP, relay churn), re-probe connections with:
+If your server moves (new IP, relay churn), the settings window (`c`) has a
+server address field and a **Detect automatically** button. The same thing from
+a shell:
 
 ```sh
-~/.config/omarchy/plugins/io.github.kyllan.plexamp/bin/plexamp-auth rediscover
+~/.config/omarchy/plugins/io.github.kyllan.ampbar/bin/plexamp-auth rediscover
+~/.config/omarchy/plugins/io.github.kyllan.ampbar/bin/plexamp-auth server 192.168.1.10:32400
 ```
+
+A bare host gets `http://` and `:32400` filled in. The address is verified
+against `/identity` before it is saved, so a typo leaves the working one alone.
 
 ## Keys
 
@@ -65,9 +89,12 @@ Inside the dropdown:
 | `Enter` | Play what's under the cursor |
 | `Space` | Play / pause — everywhere, including the mini viewer |
 | `Tab` / `Shift+Tab` | Switch tab |
-| `1` / `2` / `3` | Home / Radio / Search |
+| `1` / `2` / `3` / `4` | Home / Next up / Radio / Search |
+| `u` | Next up (the live queue) |
 | `/` | Jump to the search box |
 | `v` | Mini viewer (big art, minimal controls) |
+| `c` | Settings window |
+| `?` | Show / hide the shortcut hint line |
 | `p` | Play / pause (same as `Space`) |
 | `n` / `b` | Next / previous track |
 | `,` / `.` | Seek 5s back / forward |
@@ -78,7 +105,7 @@ Inside the dropdown:
 | `d` | Browse the current album |
 | `R` | Start radio from the current artist |
 | `L` | Switch music library (when the server has more than one) |
-| `x` / `Backspace` | Like `h`, but closes the panel once there's nothing left to leave |
+| `Backspace` | Like `h`, but closes the panel once there's nothing left to leave |
 | `g` / `G` | Jump to top / bottom of the list |
 | `r` | Reload the library |
 | `s` | Sign in (when signed out) |
@@ -86,15 +113,20 @@ Inside the dropdown:
 | `Esc` | Close |
 
 In the search box, `Enter` runs the search and moves focus to the results, `↓`
-does the same without waiting, and `Esc` steps back to the list.
+does the same without waiting, and `Esc` steps back to the list. Holding `Enter`
+no longer opens whatever the cursor lands on: a Return arriving right after the
+search is committed is swallowed.
 
-`Tab` wraps around the three tabs in both directions, from inside the search box
+`Tab` wraps around all four tabs in both directions, from inside the search box
 too.
+
+`x` is not a back key. `h` is the only one that steps back, plus `Backspace`
+when you also want the panel to close at the end.
 
 Every key means the same thing in the mini viewer as it does in the full panel:
 `h` leaves it, `,` / `.` seek, `Space` toggles play, `n` / `b` skip. Reaching for
-the library — a tab key, `/`, `a`, `d`, `r`, `L` — drops you back into the full
-panel on its own.
+the library — a tab key, `/`, `u`, `a`, `d`, `r`, `L` — drops you back into the
+full panel on its own.
 
 The radio button dims when there's nothing to seed a station from — no artist on
 the current track, and no library station to fall back on.
@@ -108,15 +140,15 @@ the cover art for the mini viewer, and click anywhere on the waveform to seek.
 The plugin exposes IPC methods you can bind anywhere in Hyprland:
 
 ```sh
-omarchy-shell io.github.kyllan.plexamp toggle
-omarchy-shell io.github.kyllan.plexamp playPause
-omarchy-shell io.github.kyllan.plexamp next
-omarchy-shell io.github.kyllan.plexamp previous
-omarchy-shell io.github.kyllan.plexamp volumeUp
-omarchy-shell io.github.kyllan.plexamp volumeDown
-omarchy-shell io.github.kyllan.plexamp radio
-omarchy-shell io.github.kyllan.plexamp mini
-omarchy-shell io.github.kyllan.plexamp status
+omarchy-shell io.github.kyllan.ampbar toggle
+omarchy-shell io.github.kyllan.ampbar playPause
+omarchy-shell io.github.kyllan.ampbar next
+omarchy-shell io.github.kyllan.ampbar previous
+omarchy-shell io.github.kyllan.ampbar volumeUp
+omarchy-shell io.github.kyllan.ampbar volumeDown
+omarchy-shell io.github.kyllan.ampbar radio
+omarchy-shell io.github.kyllan.ampbar mini
+omarchy-shell io.github.kyllan.ampbar status
 ```
 
 `omarchy-shell <target> <method>` addresses the plugin's own IPC handler. The
@@ -126,10 +158,11 @@ omarchy-shell io.github.kyllan.plexamp status
 plugin was set up with — add them to `~/.config/hypr/bindings.lua` yourself:
 
 ```lua
-o.bind("SUPER + M", "Plexamp", "omarchy-shell io.github.kyllan.plexamp toggle")
-o.bind("SUPER + ALT + P", "Plexamp play/pause", "omarchy-shell io.github.kyllan.plexamp playPause")
-o.bind("SUPER + ALT + N", "Plexamp next track", "omarchy-shell io.github.kyllan.plexamp next")
-o.bind("SUPER + ALT + B", "Plexamp previous track", "omarchy-shell io.github.kyllan.plexamp previous")
+hl.unbind("SUPER + SHIFT + M")  -- Omarchy binds this to Spotify
+o.bind("SUPER + SHIFT + M", "Ampbar for Plex", "omarchy-shell io.github.kyllan.ampbar toggle")
+o.bind("SUPER + ALT + P", "Ampbar play/pause", "omarchy-shell io.github.kyllan.ampbar playPause")
+o.bind("SUPER + ALT + N", "Ampbar next track", "omarchy-shell io.github.kyllan.ampbar next")
+o.bind("SUPER + ALT + B", "Ampbar previous track", "omarchy-shell io.github.kyllan.ampbar previous")
 ```
 
 The `XF86Audio*` media keys are deliberately left alone: Omarchy already routes
@@ -137,20 +170,36 @@ them to MPRIS, and taking them would break media control in your browser.
 
 ## Settings
 
-Available from the bar widget settings:
+Press `c` (or the gear in the transport row) for a floating settings window —
+its own layer-shell surface, not another page of the dropdown. `j` / `k` move,
+`Enter` changes, `Esc` closes. It covers:
 
-- **Hide the widget when nothing is playing** — off by default, so the widget is
-  always there as a launcher.
-- **Show the album cover in the bar while a track is loaded** — on by default.
-  Turn it off to go back to the animated sound bars.
-- **History entries to load** — how deep the Home tab's history list goes.
+- **Server address** — type an IP or host to pin the plugin to one connection,
+  or **Detect automatically** to re-probe. Only `bin/plexamp-auth` ever touches
+  the credentials file.
+- **Show keyboard shortcuts** — the hint line along the bottom of the panel.
+  `?` toggles it too.
+- **Album cover in the bar** — off falls back to the animated sound bars.
+- **Hide the widget when idle** — off by default, so the widget is always there
+  as a launcher.
+- **Show one next-up track in the mini viewer** — off starts with no preview;
+  the **Up next** header always expands the list when you want more.
+- **Sign out of Plex**.
 
-Volume and the chosen music library are remembered in
+The same options (plus **History entries to load**, how deep the Home tab's
+history goes) are in the bar widget settings. The settings window writes to the
+plugin's own state file, which wins over the shell.json entry — a plugin can't
+safely rewrite the shell config from underneath the shell.
+
+Volume, the chosen music library, and these preferences are remembered in
 `~/.local/state/omarchy/plexamp/state.json`.
 
 ## Tabs
 
-- **Home** — recent plays, recently added, and your listening history.
+- **Home** — five most-played albums (with radio/single fallbacks) from this
+  month, five recently added albums, then your listening history.
+- **Next up** — the live queue: what's playing, then everything after it.
+  `Enter` on a row jumps straight to it and keeps the rest of the queue.
 - **Radio** — the stations Plex generates for the library, plus a station seeded
   from whatever is playing.
 - **Search** — artists, albums and tracks, searched as you type.
@@ -170,6 +219,15 @@ back to loading the track the ordinary way if mpv never moves.
 The next track's waveform is analysed on the same schedule, so the timeline is
 drawn the moment the track starts instead of a second into it.
 
+## Shell refreshes
+
+The mpv player runs in its own separate session rather than as a child of the
+reloadable Quickshell service. A shell or plugin refresh
+therefore leaves audio and mpv's current timestamp alone; when the service
+returns, it reconnects to mpv and restores the queue description from its state
+file. Refreshing the shell will still close the panel itself, but it should not
+restart the song.
+
 ## The waveform
 
 Your server exposes no loudness ramps (that needs Plex's own sonic analysis), so
@@ -188,15 +246,38 @@ analysed once and never again. Tracks it can't read fall back to a plain progres
 | `Service.qml` | Plex session, library queries, play queue, mpv IPC |
 | `Panel.qml` | Bar button and the keyboard-driven dropdown |
 | `PlexApi.js` | Pure URL-building and response-parsing helpers |
+| `PlexSettings.qml` | The floating settings window (its own layer surface) |
 | `PlexPanel.qml` | Vendored `Ui/KeyboardPanel` with a tintable card background |
 | `SeekBar.qml` | Elapsed / waveform / remaining, with a plain-bar fallback |
 | `Waveform.qml` | The mirrored envelope itself, drawn on two clipped canvases |
-| `PlexIcon.qml` | The Plex chevron, drawn to match the bar foreground |
+| `AmpIcon.qml` | Original equalizer mark used when no album art is loaded |
 | `SoundBars.qml` | Animated playing indicator, and the bar's art fallback |
 | `bin/plexamp-auth` | plex.tv PIN sign-in and server discovery |
+| `bin/plexamp-engine` | detached mpv launcher that survives shell reloads |
 | `bin/plexamp-waveform` | ffmpeg loudness envelope, cached per track |
 
 `PlexPanel.qml` is a copy of Omarchy's `Ui/KeyboardPanel` with one change — the
 card's fill is a property instead of a hard-coded theme colour, which is what
 lets the album palette reach the panel's edges. Re-sync it if that file changes
 upstream.
+
+## Security and privacy
+
+This plugin runs as unsandboxed code inside Omarchy's shell and launches local
+helpers. It requires `mpv`, `ffmpeg`, `curl`, `jq`, `python3`, `bash`, and
+`setsid`; it never uses `sudo` or installs packages. It contacts Plex only for
+PIN sign-in/server discovery and the Plex Media Server selected by the user.
+Its mpv IPC socket is restricted to the per-user `$XDG_RUNTIME_DIR`, not `/tmp`.
+See [PRIVACY.md](PRIVACY.md) for token, stream-URL, and local-state details.
+
+## License, Plex, and attribution
+
+Except for the vendored Omarchy component described in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md), this code is dedicated to the
+public domain under [CC0-1.0](LICENSE); reuse and attribution are optional.
+
+Plex, Plex Media Server, and Plexamp are trademarks of Plex, Inc. Plex is used
+under license from Plex. Ampbar for Plex is independent and is not affiliated
+with or endorsed by Plex. This code license does not grant rights to Plex
+trademarks, Plex services, library artwork, or music; use of the integration is
+subject to Plex's terms and to the rights covering the user's media.

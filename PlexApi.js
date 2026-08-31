@@ -269,6 +269,56 @@ function resolveHistory(base, token, entries, map) {
     return out;
 }
 
+// Plex's history endpoint is track-based. For Home, turn this month's plays
+// into the things people actually choose to put on: albums first, with a
+// seedable artist-radio fallback for entries that have no album parent.
+// `entries` is newest-first, so latestSeen also makes a stable tie-breaker.
+function mostPlayedThisMonth(base, token, entries, monthStart, limit) {
+    var buckets = {};
+    var ordered = [];
+    var start = Number(monthStart || 0);
+    for (var i = 0; i < entries.length; i++) {
+        var entry = entries[i];
+        if (!entry || Number(entry.viewedAt || 0) < start)
+            continue;
+
+        var albumKey = String(entry.albumKey || "");
+        var artistKey = String(entry.artistKey || "");
+        var kind = albumKey ? "album" : (artistKey ? "station" : "");
+        var ratingKey = albumKey || artistKey;
+        if (!kind || !ratingKey)
+            continue;
+
+        var id = kind + ":" + ratingKey;
+        var bucket = buckets[id];
+        if (!bucket) {
+            bucket = {
+                kind: kind,
+                ratingKey: ratingKey,
+                title: kind === "album" ? (entry.album || "Unknown album")
+                                         : ((entry.artist || "Radio picks") + " radio"),
+                artist: kind === "album" ? (entry.artist || "") : "Radio / single tracks",
+                art: artUrl(base, token, entry.thumb || "", 200),
+                key: kind === "station"
+                  ? ("/library/metadata/" + artistKey + "/station/1") : "",
+                plays: 0,
+                latestSeen: 0
+            };
+            buckets[id] = bucket;
+            ordered.push(bucket);
+        }
+        bucket.plays++;
+        bucket.latestSeen = Math.max(bucket.latestSeen, Number(entry.viewedAt || 0));
+    }
+
+    ordered.sort(function (a, b) {
+        if (b.plays !== a.plays)
+            return b.plays - a.plays;
+        return b.latestSeen - a.latestSeen;
+    });
+    return ordered.slice(0, Math.max(0, Number(limit || 5)));
+}
+
 // Unique ratingKeys, in first-seen order, for a batched /library/metadata call.
 function uniqueKeys(entries) {
     var seen = {};
@@ -378,7 +428,7 @@ function formatAgo(unixSeconds, nowSeconds) {
 
 // ------------------------------------------------------------- album tint --
 
-// Plex ships a four-corner palette per album; Plexamp paints it behind the
+// Plex exposes a four-corner palette per album; Ampbar paints it behind the
 // player and so do we. Values are bare hex triples, no leading '#'.
 function ultraBlur(item) {
     var colors = item && item.UltraBlurColors;
@@ -447,7 +497,7 @@ function albumsFromLeaves(base, token, response, exclude) {
 var SIDE_RELEASE = /\b(live|in concert|compilation|greatest hits|the best of|remix|remixes|demo|demos|b[- ]sides?|rarities|soundtrack|session|sessions|instrumental|karaoke|acoustic version)\b/i;
 
 // Albums proper first, then short releases, then everything that reads like a
-// side release — the same shape as the Plexamp artist page.
+// side release — a useful shape for the artist browser.
 function groupArtistAlbums(items, counts, singleMax) {
     var limit = singleMax || 6;
     var main = [];

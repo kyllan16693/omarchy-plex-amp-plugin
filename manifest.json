@@ -1,11 +1,11 @@
 {
   "schemaVersion": 1,
-  "id": "io.github.kyllan.plexamp",
-  "name": "Plexamp",
+  "id": "io.github.kyllan.ampbar",
+  "name": "Ampbar for Plex",
   "version": "0.1.0",
   "author": "kyllan",
-  "license": "MIT",
-  "description": "Stream music from your Plex library in the Omarchy bar: the cover of whatever is loaded sits in the bar, and a keyboard-driven dropdown carries a waveform scrubber, transport controls, and library browsing.",
+  "license": "CC0-1.0",
+  "description": "An independent Omarchy bar player for your personal Plex music library, with playback controls, waveform seeking, and library browsing.",
   "kinds": [
     "service",
     "bar-widget"
@@ -16,15 +16,17 @@
     "barWidget": "Panel.qml"
   },
   "barWidget": {
-    "displayName": "Plexamp",
-    "description": "Plex music player with cover art and transport controls.",
+    "displayName": "Ampbar for Plex",
+    "description": "Independent Plex music player with cover art and transport controls.",
     "category": "Media",
     "allowMultiple": false,
     "defaultSection": "right",
     "defaults": {
       "recentLimit": 40,
       "hideWhenIdle": false,
-      "barArt": true
+      "barArt": true,
+      "showHints": true,
+      "miniQueuePreview": false
     },
     "schema": [
       {
@@ -38,6 +40,18 @@
         "type": "boolean",
         "label": "Show the album cover in the bar while a track is loaded",
         "defaultValue": true
+      },
+      {
+        "key": "showHints",
+        "type": "boolean",
+        "label": "Show the keyboard shortcut hints along the bottom",
+        "defaultValue": true
+      },
+      {
+        "key": "miniQueuePreview",
+        "type": "boolean",
+        "label": "Show one next-up track in the mini viewer",
+        "defaultValue": false
       },
       {
         "key": "recentLimit",

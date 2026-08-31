@@ -1,14 +1,24 @@
 #!/usr/bin/env bash
-# Install (or reinstall) the Plexamp plugin into the Omarchy plugin directory.
+# Install (or reinstall) the Ampbar for Plex plugin into the Omarchy plugin directory.
 #
 # Files are copied rather than symlinked: omarchy-plugin-validate rejects any
 # symlink inside a plugin folder, so a symlinked dev checkout would never load.
 
 set -euo pipefail
 
-PLUGIN_ID="io.github.kyllan.plexamp"
+PLUGIN_ID="io.github.kyllan.ampbar"
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEST="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plugins/$PLUGIN_ID"
+
+# The only destructive operations below are constrained to this plugin's own
+# directory. Keep that invariant explicit if this script is ever refactored.
+case "$DEST" in
+  */omarchy/plugins/"$PLUGIN_ID") ;;
+  *)
+    echo "refusing unsafe plugin destination: $DEST" >&2
+    exit 2
+    ;;
+esac
 
 echo "==> Installing $PLUGIN_ID"
 echo "    from $SRC"
@@ -19,6 +29,7 @@ echo "    to   $DEST"
 # has been seen to crash mid-reload under that storm. The dot prefix keeps the
 # staging directory out of the plugin scan while it fills up.
 STAGE="$(dirname "$DEST")/.$PLUGIN_ID.installing"
+[[ "$STAGE" != "$DEST" ]] || { echo "staging path overlaps destination" >&2; exit 2; }
 mkdir -p "$(dirname "$DEST")"
 rm -rf "$STAGE"
 mkdir -p "$STAGE"
