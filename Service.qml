@@ -62,6 +62,9 @@ Item {
   property int playQueueId: 0
 
   property bool isPlaying: false
+  // True only after mpv confirms it has media loaded. This prevents a saved
+  // queue from making Play unpause an otherwise idle mpv after a cold start.
+  property bool engineHasFile: false
   property real position: 0
   property real duration: 0
   property int volume: 70
@@ -199,6 +202,7 @@ Item {
     pinUrl = ""
     authState = "ready"
     refreshLibrary()
+    tryRestorePlayback()
   }
 
   function login() {
@@ -1079,6 +1083,7 @@ Item {
       break
     case "file-loaded":
       playbackError = ""
+      engineHasFile = true
       positionTimer.restart()
       break
     }
@@ -1103,8 +1108,11 @@ Item {
       muted = data === true
       break
     case "core-idle":
-      if (data === true && isPlaying) positionTimer.stop()
-      else if (data === false && hasTrack) positionTimer.restart()
+      engineHasFile = data === false
+      if (data === true) {
+        isPlaying = false
+        positionTimer.stop()
+      } else if (hasTrack) positionTimer.restart()
       break
     case "playlist-pos":
       // The playlist never holds more than [current, up-next], so mpv landing
@@ -1172,6 +1180,7 @@ Item {
     var track = currentTrack
     if (!track || !track.stream) return
     ensureEngine()
+    engineHasFile = false
     queuedKey = ""
     advanceGuard.stop()
     sendCommand(["loadfile", track.stream, "replace"])
@@ -1227,6 +1236,10 @@ Item {
 
   function play() {
     if (!hasTrack) return
+    if (!engineHasFile) {
+      loadCurrent()
+      return
+    }
     sendCommand(["set_property", "pause", false])
     isPlaying = true
     positionTimer.restart()
@@ -1304,6 +1317,7 @@ Item {
     isPlaying = false
     position = 0
     queuedKey = ""
+    engineHasFile = false
     advanceGuard.stop()
     if (ipc.connected) sendCommand(["stop"])
     reportProgress("stopped")
@@ -1372,6 +1386,9 @@ Item {
   property var _savedPlayback: null
   property bool _stateRead: false
   property bool _playbackRestored: false
+  property bool _playbackRestoring: false
+  // Used to upgrade older state files that included token-bearing stream URLs.
+  property var _pendingSanitizedPlayback: null
 
   FileView {
     id: stateFile
@@ -1386,12 +1403,16 @@ Item {
           root.volume = Math.max(0, Math.min(100, Math.round(data.volume)))
         if (data && data.sectionKey) root._savedSectionKey = String(data.sectionKey)
         if (data && data.prefs && typeof data.prefs === "object") root.prefs = data.prefs
-        if (data && data.playback && Array.isArray(data.playback.queue))
-          root._savedPlayback = data.playback
+        if (data && data.playback && Array.isArray(data.playback.queue)) {
+          root._savedPlayback = root.sanitizePlayback(data.playback)
+          if (root.playbackHasSensitiveUrls(data.playback))
+            root._pendingSanitizedPlayback = root._savedPlayback
+        }
       } catch (e) {
         // A missing or corrupt state file just means defaults.
       }
       root._stateRead = true
+      root.writeSanitizedSavedState()
       root.tryRestorePlayback()
     }
     onLoadFailed: {
@@ -1408,38 +1429,110 @@ Item {
   // It never calls loadCurrent() here, which is what preserves the song and
   // its exact position.
   function tryRestorePlayback() {
-    if (_playbackRestored || !_stateRead || !ipc.connected || !_savedPlayback)
+    if (_playbackRestored || _playbackRestoring || !_stateRead || !ipc.connected
+        || !_savedPlayback || !ready)
       return
     var saved = _savedPlayback
     if (!saved.queue || !saved.queue.length) {
       _playbackRestored = true
       return
     }
-    var restored = []
+    var keys = []
     for (var i = 0; i < saved.queue.length; i++) {
       var track = saved.queue[i]
-      if (track && track.ratingKey && track.stream) restored.push(track)
+      if (track && track.ratingKey) keys.push(String(track.ratingKey))
     }
-    if (!restored.length) {
+    if (!keys.length) {
       _playbackRestored = true
       return
     }
-    queue = restored
-    queueIndex = Math.max(0, Math.min(Number(saved.queueIndex || 0), restored.length - 1))
-    queueSource = String(saved.queueSource || "")
-    queueTitle = String(saved.queueTitle || "")
-    playQueueId = Number(saved.playQueueId || 0)
-    duration = currentTrack ? Number(currentTrack.duration || 0) : 0
-    _playbackRestored = true
-    requestWaveform()
-    requestTint()
-    sendCommand(["get_property", "pause"], function (value) {
-      isPlaying = hasTrack && value === false
-      if (isPlaying) positionTimer.restart()
+    _playbackRestoring = true
+    request("/library/metadata/" + keys.join(","), {}, function (detail) {
+      root._playbackRestoring = false
+      var map = PlexApi.trackMap(root.serverUri, root.serverToken, detail)
+      var restored = []
+      for (var j = 0; j < saved.queue.length; j++) {
+        var key = String(saved.queue[j].ratingKey || "")
+        if (map[key]) restored.push(map[key])
+      }
+      if (!restored.length) {
+        root._playbackRestored = true
+        return
+      }
+      root.queue = restored
+      root.queueIndex = Math.max(0, Math.min(Number(saved.queueIndex || 0), restored.length - 1))
+      root.queueSource = String(saved.queueSource || "")
+      root.queueTitle = String(saved.queueTitle || "")
+      root.playQueueId = Number(saved.playQueueId || 0)
+      root.duration = root.currentTrack ? Number(root.currentTrack.duration || 0) : 0
+      root._playbackRestored = true
+      root.requestWaveform()
+      root.requestTint()
+      // A saved queue is UI metadata. Confirm that this live mpv instance has
+      // the same stream before claiming audio survived a shell refresh.
+      root.sendCommand(["get_property", "path"], function (path) {
+        if (!root.currentTrack || String(path || "") !== String(root.currentTrack.stream || "")) {
+          root.engineHasFile = false
+          root.isPlaying = false
+          root.position = 0
+          positionTimer.stop()
+          return
+        }
+        root.engineHasFile = true
+        root.sendCommand(["get_property", "pause"], function (value) {
+          root.isPlaying = root.hasTrack && value === false
+          if (root.isPlaying) positionTimer.restart()
+        })
+        root.sendCommand(["get_property", "time-pos"], function (value) {
+          if (typeof value === "number") root.position = value
+        })
+      })
+    }, function () {
+      root._playbackRestoring = false
     })
-    sendCommand(["get_property", "time-pos"], function (value) {
-      if (typeof value === "number") position = value
-    })
+  }
+
+  function queueReferences(source) {
+    var refs = []
+    var list = source || []
+    for (var i = 0; i < list.length; i++) {
+      if (list[i] && list[i].ratingKey)
+        refs.push({ ratingKey: String(list[i].ratingKey) })
+    }
+    return refs
+  }
+
+  function sanitizePlayback(playback) {
+    var saved = playback || {}
+    return {
+      queue: queueReferences(saved.queue),
+      queueIndex: Number(saved.queueIndex || 0),
+      queueSource: String(saved.queueSource || ""),
+      queueTitle: String(saved.queueTitle || ""),
+      playQueueId: Number(saved.playQueueId || 0)
+    }
+  }
+
+  function playbackHasSensitiveUrls(playback) {
+    var list = playback && playback.queue ? playback.queue : []
+    for (var i = 0; i < list.length; i++)
+      if (list[i] && (list[i].stream || list[i].art)) return true
+    return false
+  }
+
+  function stateDocument(playback) {
+    return JSON.stringify({
+      volume: root.volume,
+      sectionKey: root.musicSectionKey || root._savedSectionKey,
+      prefs: root.prefs,
+      playback: playback
+    }, null, 2) + "\n"
+  }
+
+  function writeSanitizedSavedState() {
+    if (!_stateLoaded || !_pendingSanitizedPlayback) return
+    stateFile.setText(stateDocument(_pendingSanitizedPlayback))
+    _pendingSanitizedPlayback = null
   }
 
   function persistState() {
@@ -1457,18 +1550,13 @@ Item {
   }
 
   function writeState() {
-    stateFile.setText(JSON.stringify({
-      volume: root.volume,
-      sectionKey: root.musicSectionKey,
-      prefs: root.prefs,
-      playback: {
-        queue: root.queue,
-        queueIndex: root.queueIndex,
-        queueSource: root.queueSource,
-        queueTitle: root.queueTitle,
-        playQueueId: root.playQueueId
-      }
-    }, null, 2) + "\n")
+    stateFile.setText(stateDocument({
+      queue: queueReferences(root.queue),
+      queueIndex: root.queueIndex,
+      queueSource: root.queueSource,
+      queueTitle: root.queueTitle,
+      playQueueId: root.playQueueId
+    }))
   }
 
   Timer {
@@ -1482,14 +1570,26 @@ Item {
     id: mkdirProcess
     running: false
     command: ["mkdir", "-p", root.stateDir]
-    onExited: root._stateLoaded = true
+    onExited: stateModeProcess.running = true
+  }
+
+  Process {
+    id: stateModeProcess
+    running: false
+    command: ["chmod", "700", root.stateDir]
+    onExited: {
+      root._stateLoaded = true
+      root.writeSanitizedSavedState()
+    }
   }
 
   Component.onCompleted: {
     mkdirProcess.running = true
     stateFile.reload()
     authFile.reload()
-    ensureEngine()
+    // Attach after a refresh, but never create an idle detached player simply
+    // because the plugin has loaded.
+    if (socketPath) ipc.connected = true
   }
 
   Component.onDestruction: {

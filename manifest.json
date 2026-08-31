@@ -4,7 +4,7 @@
   "name": "Ampbar for Plex",
   "version": "0.1.0",
   "author": "kyllan",
-  "license": "CC0-1.0",
+  "license": "CC0-1.0 AND MIT",
   "description": "An independent Omarchy bar player for your personal Plex music library, with playback controls, waveform seeking, and library browsing.",
   "kinds": [
     "service",

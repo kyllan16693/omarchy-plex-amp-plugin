@@ -16,9 +16,12 @@ only do that on a network you trust.
 
 The plugin stores Plex account/server tokens and a client identifier in
 `~/.config/omarchy/plexamp/` with mode `0600`. Playback preferences, queue
-metadata, and waveform caches live in `~/.local/state/omarchy/plexamp/`.
-Streaming URLs may contain a Plex token; they are passed only to the local mpv
-process and its per-user IPC socket under `$XDG_RUNTIME_DIR`.
+rating keys, and waveform caches live in `~/.local/state/omarchy/plexamp/`,
+whose directory is set to mode `0700`. Full stream and artwork URLs are not
+written to state. A stream URL can contain a Plex token; it is retained only in
+the live player, passed to waveform analysis through a mode-`0600` temporary
+curl config, and removed as soon as that request ends. The mpv IPC socket lives
+under `$XDG_RUNTIME_DIR`.
 
 Removing the plugin does not delete credentials or state automatically. Sign
 out before removal to delete `auth.json`, and remove the two directories above

@@ -47,13 +47,13 @@ for helper in "$SRC"/bin/*; do
   chmod +x "$STAGE/bin/$(basename "$helper")"
 done
 
-rm -rf "$DEST"
-mv "$STAGE" "$DEST"
-
 if command -v omarchy >/dev/null 2>&1; then
   echo "==> Validating"
-  omarchy plugin validate "$DEST"
+  omarchy plugin validate "$STAGE"
 fi
+
+rm -rf "$DEST"
+mv "$STAGE" "$DEST"
 
 if command -v omarchy-shell >/dev/null 2>&1; then
   echo "==> Rescanning plugins"

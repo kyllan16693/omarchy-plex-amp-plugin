@@ -268,7 +268,10 @@ helpers. It requires `mpv`, `ffmpeg`, `curl`, `jq`, `python3`, `bash`, and
 `setsid`; it never uses `sudo` or installs packages. It contacts Plex only for
 PIN sign-in/server discovery and the Plex Media Server selected by the user.
 Its mpv IPC socket is restricted to the per-user `$XDG_RUNTIME_DIR`, not `/tmp`.
-See [PRIVACY.md](PRIVACY.md) for token, stream-URL, and local-state details.
+The state directory is mode `0700`; saved queues contain rating keys only, and
+the waveform helper uses a mode-`0600` temporary curl config so token-bearing
+stream URLs never appear in process arguments. See [PRIVACY.md](PRIVACY.md) for
+the full token, stream-URL, and local-state details.
 
 ## License, Plex, and attribution
 

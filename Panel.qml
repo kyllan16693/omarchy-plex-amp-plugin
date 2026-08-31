@@ -51,7 +51,7 @@ Panel {
   // Its Up next header is always expandable, regardless of that preference.
   readonly property bool miniQueueDefault: plex ? plex.pref("miniQueuePreview", false) === true : false
   property bool miniQueueExpanded: false
-  onMiniChanged: if (mini) miniQueueExpanded = miniQueueDefault
+  onMiniChanged: if (mini) miniQueueExpanded = false
 
   readonly property var miniUpNext: {
     if (!plex) return []

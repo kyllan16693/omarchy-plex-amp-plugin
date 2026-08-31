@@ -9,8 +9,9 @@
 #
 # Usage: plexamp-waveform <ratingKey>   # stream URL arrives on stdin
 #
-# The URL carries an X-Plex-Token, which is why it comes in over stdin instead
-# of argv: argv is world-readable through /proc.
+# The URL carries an X-Plex-Token, which is why it comes in over stdin. It is
+# subsequently held in a mode-0600 curl config file rather than passed to
+# ffmpeg or curl as argv: argv is readable through /proc on many systems.
 set -uo pipefail
 
 BUCKETS=120
@@ -38,11 +39,28 @@ emit_cached && exit 0
 
 IFS= read -r url || true
 [ -n "${url:-}" ] || { printf '%s\n' '{"stage":"error","message":"no stream url"}'; exit 1; }
+case "$url" in
+  http://*|https://*) ;;
+  *) printf '%s\n' '{"stage":"error","message":"bad stream url"}'; exit 1 ;;
+esac
 
+umask 077
 mkdir -p "$STATE_DIR" || true
+chmod 700 "$STATE_DIR" 2>/dev/null || true
+
+# curl's config grammar accepts a quoted URL. Escape its two meaningful
+# characters so a malformed server response cannot add another curl option.
+curl_config_escape() {
+  sed 's/\\\\/\\\\\\\\/g; s/"/\\\\"/g'
+}
+
+request_config="$(mktemp "$STATE_DIR/.request.XXXXXX")" || exit 1
+trap 'rm -f "$request_config"' EXIT
+printf 'url = "%s"\n' "$(printf '%s' "$url" | curl_config_escape)" > "$request_config"
 
 peaks="$(
-  timeout 90 nice -n 19 ffmpeg -v error -nostdin -i "$url" -ac 1 -ar 4000 -f s16le - 2>/dev/null \
+  timeout 90 curl -fsSL --config "$request_config" 2>/dev/null \
+  | nice -n 19 ffmpeg -v error -nostdin -i pipe:0 -ac 1 -ar 4000 -f s16le - 2>/dev/null \
   | BUCKETS="$BUCKETS" python3 -c '
 import sys, os, struct, math, json
 
