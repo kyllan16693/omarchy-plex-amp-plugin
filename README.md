@@ -13,12 +13,29 @@ seek, skip, volume and what's queued next.
 The plugin *is* the player — it talks to the Plex Media Server API for your
 library and stream URLs, then plays them through a headless `mpv` it controls
 over an IPC socket. The official Plexamp application is not required or used.
-The previews below are illustrative UI mockups; they do not contain a user's
-library or account data.
+The screenshots below are real captures of Ampbar running in Omarchy.
 
-![Ampbar home and now-playing panel](assets/screenshots/home.png)
+## Screenshots
 
-![Ampbar mini player](assets/screenshots/mini-player.png)
+Home — now playing and listening history:
+
+![Ampbar Home](assets/screenshots/home.png)
+
+Next up — the active queue:
+
+![Ampbar Next up](assets/screenshots/next-up.png)
+
+Mini player — default one-track Up next preview:
+
+![Ampbar mini player](assets/screenshots/mini-default.png)
+
+Mini player — expanded Up next queue:
+
+![Ampbar mini player with expanded queue](assets/screenshots/mini-expanded.png)
+
+Radio — seeded and library stations:
+
+![Ampbar Radio](assets/screenshots/radio.png)
 
 ## Requirements
 
