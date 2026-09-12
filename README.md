@@ -62,7 +62,8 @@ and enables it.
 omarchy plugin remove io.github.kyllan.ampbar
 ```
 
-Sign out first if you want the credential file removed. See [Privacy](PRIVACY.md)
+Disabling or removing the plugin stops its player automatically (normally
+within one second). Sign out first if you want the credential file removed. See [Privacy](PRIVACY.md)
 for the optional local-state cleanup paths.
 
 ## Sign in
@@ -238,12 +239,16 @@ drawn the moment the track starts instead of a second into it.
 
 ## Shell refreshes
 
-The mpv player runs in its own separate session rather than as a child of the
-reloadable Quickshell service. A shell or plugin refresh
-therefore leaves audio and mpv's current timestamp alone; when the service
-returns, it reconnects to mpv and restores the queue description from its state
-file. Refreshing the shell will still close the panel itself, but it should not
-restart the song.
+The mpv player runs under a supervisor in a separate session from the
+reloadable Quickshell service. A shell or plugin refresh therefore leaves audio
+and mpv's current timestamp alone; when the service returns, it reconnects to
+mpv and restores the queue description from its state file. Refreshing the
+shell will still close the panel itself, but it should not restart the song.
+
+The supervisor watches the plugin's source directory and enabled entry in
+Omarchy's `shell.json`. Disabling or removing the plugin shuts down mpv. A
+temporarily unreadable shell configuration gets five seconds to recover before
+the player stops.
 
 ## The waveform
 
@@ -270,7 +275,7 @@ analysed once and never again. Tracks it can't read fall back to a plain progres
 | `AmpIcon.qml` | Original equalizer mark used when no album art is loaded |
 | `SoundBars.qml` | Animated playing indicator, and the bar's art fallback |
 | `bin/plexamp-auth` | plex.tv PIN sign-in and server discovery |
-| `bin/plexamp-engine` | detached mpv launcher that survives shell reloads |
+| `bin/plexamp-engine` | mpv supervisor that survives reloads and stops on removal |
 | `bin/plexamp-waveform` | ffmpeg loudness envelope, cached per track |
 
 `PlexPanel.qml` is a copy of Omarchy's `Ui/KeyboardPanel` with one change — the
@@ -278,14 +283,27 @@ card's fill is a property instead of a hard-coded theme colour, which is what
 lets the album palette reach the panel's edges. Re-sync it if that file changes
 upstream.
 
+## Development
+
+`./install.sh` copies the checkout into the plugin directory, validates it, and
+enables it. The tests under `tests/` use private temporary directories, a fake
+Plex server, silent audio, and never touch the running desktop:
+
+```sh
+python3 -m unittest discover -s tests -v
+```
+
+The fresh-install smoke test drives the real Service in an offscreen Quickshell
+against a real mpv, so it needs Omarchy, Quickshell, mpv, ffmpeg, curl, and jq.
+
 ## Security and privacy
 
 This plugin runs as unsandboxed code inside Omarchy's shell and launches local
 helpers. It requires `mpv`, `ffmpeg`, `curl`, `jq`, `python3`, `bash`, and
-`setsid`; it never uses `sudo` or installs packages. It contacts Plex only for
+standard Linux utilities; it never uses `sudo` or installs packages. It contacts Plex only for
 PIN sign-in/server discovery and the Plex Media Server selected by the user.
 Its mpv IPC socket is restricted to the per-user `$XDG_RUNTIME_DIR`, not `/tmp`.
-The state directory is mode `0700` (with a `0600` state file); saved queues contain rating keys only, and
+The state directory is mode `0700`; saved queues contain rating keys only, and
 the waveform helper uses a mode-`0600` temporary curl config so token-bearing
 stream URLs never appear in process arguments. See [PRIVACY.md](PRIVACY.md) for
 the full token, stream-URL, and local-state details.
