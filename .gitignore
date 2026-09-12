@@ -2,3 +2,5 @@
 *~
 .DS_Store
 Pasted image*.png
+.claude/
+__pycache__/
