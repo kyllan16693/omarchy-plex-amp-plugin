@@ -1,59 +1,235 @@
-#!/usr/bin/env bash
-# Start a deliberately detached mpv. Quickshell destroys child Process objects
-# during a shell/plugin reload; a separate session lets audio keep running and
-# lets the replacement Service.qml reconnect to the same IPC socket.
-set -euo pipefail
+#!/usr/bin/env python3
+"""Own mpv outside Quickshell, but only while Ampbar remains enabled."""
 
-action="${1:-start}"
-socket="${2:?missing mpv socket path}"
-volume="${3:-70}"
-runtime_dir="${XDG_RUNTIME_DIR:?XDG_RUNTIME_DIR is required}"
-
-case "$socket" in
-  "$runtime_dir"/*) ;;
-  *)
-    echo "refusing IPC socket outside XDG_RUNTIME_DIR" >&2
-    exit 2
-    ;;
-esac
-
-case "$action" in
-  start)
-    # A live socket means a previous shell instance already owns the player.
-    # Do not remove it: that is the normal hot-reload path.
-    if [[ -S "$socket" ]]; then
-      if python3 - "$socket" <<'PY'
+import fcntl
+import json
+import os
+from pathlib import Path
 import socket
+import stat
+import subprocess
 import sys
+import tempfile
+import time
+import uuid
 
-client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-client.settimeout(0.2)
-try:
-    client.connect(sys.argv[1])
-except OSError:
-    raise SystemExit(1)
-finally:
-    client.close()
-PY
-      then
-        exit 0
-      fi
-    fi
-    rm -f "$socket"
-    # setsid gives mpv a new session, so it is not terminated with the short
-    # lived QML Process that invoked this helper. mpv owns the socket lifetime.
-    setsid mpv --no-video --idle=yes --no-terminal --really-quiet \
-      --audio-display=no --gapless-audio=yes --keep-open=no \
-      --cache=yes --prefetch-playlist=yes --volume="$volume" \
-      --input-ipc-server="$socket" </dev/null >/dev/null 2>&1 &
-    ;;
-  stop)
-    # Prefer graceful shutdown through the IPC client in Service.qml. This
-    # fallback only clears a stale socket left after an unclean exit.
-    [[ -S "$socket" ]] || rm -f "$socket"
-    ;;
-  *)
-    echo "usage: plexamp-engine {start|stop} SOCKET [VOLUME]" >&2
-    exit 2
-    ;;
-esac
+PLUGIN_ID = "io.github.kyllan.ampbar"
+PLUGIN_DIR = Path(__file__).resolve().parent.parent
+CONFIG_GRACE_SECONDS = 5
+
+
+def checked_socket(value):
+    runtime = Path(os.environ.get("XDG_RUNTIME_DIR", ""))
+    if not runtime.is_absolute():
+        raise ValueError("XDG_RUNTIME_DIR must be an absolute, private directory")
+    info = runtime.stat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise ValueError("XDG_RUNTIME_DIR must be owned by the current user with mode 0700")
+    target = Path(value)
+    if target != runtime / "omarchy-ampbar.sock" or target.parent.resolve() != runtime.resolve():
+        raise ValueError("refusing IPC socket outside Ampbar's runtime location")
+    if target.is_symlink():
+        raise ValueError("refusing a symlink at the IPC socket")
+    return target
+
+
+def ipc_call(target, command=None):
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.settimeout(0.5)
+        client.connect(str(target))
+        if command:
+            client.sendall(json.dumps({"command": command}).encode() + b"\n")
+
+
+def alive(target):
+    try:
+        ipc_call(target)
+        return True
+    except OSError:
+        return False
+
+
+def quit_player(target):
+    try:
+        ipc_call(target, ["quit"])
+    except (FileNotFoundError, ConnectionRefusedError):
+        pass
+
+
+def cancellation_epoch(target):
+    try:
+        return target.with_suffix(".cancel").read_text()
+    except FileNotFoundError:
+        return ""
+
+
+def stop(target):
+    # Invalidate launches which have not bound a socket yet. Replacing the
+    # marker atomically also prevents partial reads by a running supervisor.
+    fd, name = tempfile.mkstemp(prefix=".ampbar-cancel-", dir=target.parent)
+    try:
+        with os.fdopen(fd, "w") as output:
+            output.write(uuid.uuid4().hex)
+        os.replace(name, target.with_suffix(".cancel"))
+    finally:
+        Path(name).unlink(missing_ok=True)
+    quit_player(target)
+
+
+def enabled(config_path):
+    try:
+        config = json.loads(config_path.read_text())
+        if not isinstance(config, dict):
+            return None
+        if PLUGIN_ID in config.get("disabledPlugins", []):
+            return False
+        bar = config.get("bar", {})
+        layout = bar.get("layout", {})
+        plugins = config.get("plugins", [])
+        if not isinstance(plugins, list) or not isinstance(layout, dict):
+            return None
+        entries = list(plugins)
+        for section in ("left", "center", "right"):
+            values = layout.get(section, [])
+            if not isinstance(values, list):
+                return None
+            entries.extend(values)
+        if not any((entry.get("id") if isinstance(entry, dict) else entry) == PLUGIN_ID
+                   for entry in entries):
+            return False
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+    # The installer swaps source directories during reinstall. A missing or
+    # incomplete source/config gets the same short grace period; explicit
+    # disable/removal from shell.json above still stops playback immediately.
+    try:
+        manifest = json.loads((PLUGIN_DIR / "manifest.json").read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(manifest, dict):
+        return None
+    return manifest.get("id") == PLUGIN_ID
+
+
+def supervise(target, volume, config_path, epoch):
+    # Hold one private lock for the player's lifetime. Concurrent Play clicks
+    # and replacement shell instances must never launch multiple players.
+    lock_path = target.with_suffix(".lock")
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w") as lock:
+        info = os.fstat(lock.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
+            raise ValueError("refusing unsafe player lock")
+        os.fchmod(lock.fileno(), 0o600)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return
+        lock.write("active:" + epoch)
+        lock.truncate()
+        lock.flush()
+        player = None
+        try:
+            if enabled(config_path) is not True or cancellation_epoch(target) != epoch:
+                return
+            # Adopt an older detached player on upgrade, preserving its song.
+            if not alive(target):
+                if target.exists():
+                    if not stat.S_ISSOCK(target.lstat().st_mode):
+                        raise ValueError("refusing non-socket player state")
+                    target.unlink()
+                player = subprocess.Popen([
+                    "mpv", "--no-config", "--load-scripts=no", "--no-video",
+                    "--idle=yes", "--no-terminal", "--really-quiet",
+                    "--audio-display=no", "--gapless-audio=yes", "--keep-open=no",
+                    "--cache=yes", "--prefetch-playlist=yes", f"--volume={volume}",
+                    f"--input-ipc-server={target}",
+                ], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                deadline = time.monotonic() + 5
+                while not alive(target):
+                    if cancellation_epoch(target) != epoch or enabled(config_path) is False:
+                        return
+                    if player.poll() is not None or time.monotonic() >= deadline:
+                        raise RuntimeError("mpv did not create its IPC socket")
+                    time.sleep(0.05)
+            unreadable_since = None
+            while alive(target):
+                if cancellation_epoch(target) != epoch:
+                    break
+                state = enabled(config_path)
+                if state is False:
+                    break
+                if state is None:
+                    if unreadable_since is None:
+                        unreadable_since = time.monotonic()
+                    if time.monotonic() - unreadable_since >= CONFIG_GRACE_SECONDS:
+                        break
+                else:
+                    unreadable_since = None
+                if player is not None and player.poll() is not None:
+                    break
+                time.sleep(0.5)
+        finally:
+            # A player that has not bound its socket yet cannot receive "quit";
+            # signal it directly instead of waiting on a message it never sees.
+            if player is not None and player.poll() is None and not alive(target):
+                player.terminate()
+            else:
+                quit_player(target)
+            if player is not None:
+                try:
+                    player.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    player.kill()
+                    player.wait()
+
+
+def main():
+    if len(sys.argv) < 3:
+        raise ValueError("usage: plexamp-engine {start|stop|supervise} SOCKET [VOLUME] [SHELL_CONFIG]")
+    action, value = sys.argv[1:3]
+    target = checked_socket(value)
+    volume = max(0, min(100, int(sys.argv[3]))) if len(sys.argv) > 3 else 70
+    config_path = Path(sys.argv[4]) if len(sys.argv) > 4 else Path.home() / ".config/omarchy/shell.json"
+    if action == "stop":
+        stop(target)
+    elif action == "supervise":
+        if len(sys.argv) != 6:
+            raise ValueError("supervisor requires a launch generation")
+        supervise(target, volume, config_path, sys.argv[5])
+    elif action == "start":
+        if enabled(config_path) is not True:
+            raise RuntimeError("Ampbar is not enabled in the shell configuration")
+        # The supervisor is a separate session; shell refreshes cannot kill it.
+        epoch = cancellation_epoch(target)
+        supervisor = None
+        deadline = time.monotonic() + 6
+        while True:
+            if cancellation_epoch(target) != epoch:
+                raise RuntimeError("player launch was cancelled")
+            if supervisor is None or supervisor.poll() is not None:
+                supervisor = subprocess.Popen([
+                    sys.executable, str(Path(__file__).resolve()), "supervise",
+                    str(target), str(volume), str(config_path), epoch,
+                ], start_new_session=True, stdin=subprocess.DEVNULL,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                active = target.with_suffix(".lock").read_text() == "active:" + epoch
+            except OSError:
+                active = False
+            if active and alive(target):
+                return
+            if time.monotonic() >= deadline:
+                raise RuntimeError("could not start mpv; check that mpv is installed")
+            time.sleep(0.05)
+    else:
+        raise ValueError("unknown player action")
+
+
+if __name__ == "__main__":
+    os.umask(0o077)
+    try:
+        main()
+    except (OSError, ValueError, RuntimeError) as error:
+        print(f"plexamp-engine: {error}", file=sys.stderr)
+        raise SystemExit(1)
