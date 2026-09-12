@@ -19,20 +19,26 @@ umask 077
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plexamp"
 AUTH_FILE="$CONFIG_DIR/auth.json"
 ID_FILE="$CONFIG_DIR/client-id"
+AUTH_TEMP=""
 
 PRODUCT="Ampbar for Plex"
 VERSION="0.1.0"
 PLATFORM="Linux"
 DEVICE="Omarchy"
 
-mkdir -p "$CONFIG_DIR"
+mkdir -p "$CONFIG_DIR" || exit 1
+chmod 700 "$CONFIG_DIR" || exit 1
 
 emit() { printf '%s\n' "$1"; }
 fail() { emit "$(jq -nc --arg m "$1" '{stage:"error",message:$m}')"; exit 1; }
 
 for tool in curl jq; do
-  command -v "$tool" >/dev/null 2>&1 || fail "$tool is required but not installed"
+  command -v "$tool" >/dev/null 2>&1 || {
+    printf '{"stage":"error","message":"%s is required but not installed"}\n' "$tool"
+    exit 1
+  }
 done
+trap '[[ -z "$AUTH_TEMP" ]] || rm -f "$AUTH_TEMP"' EXIT
 
 # Stable per-install client identifier.
 if [[ ! -s "$ID_FILE" ]]; then
@@ -57,14 +63,35 @@ plex_headers=(
   -H "X-Plex-Model: hosted"
 )
 
+# A pipe keeps the token out of argv, the environment, and temporary files.
+# Refuse curl-config/header metacharacters before constructing the config.
+# Authenticated requests never follow redirects: curl forwards custom headers
+# to redirect destinations, which must not receive the user's Plex token.
+authenticated_get() {
+  local token="$1" seconds="$2" target="$3"
+  [[ "$token" =~ ^[A-Za-z0-9._~-]+$ ]] || return 1
+  valid_server_uri "$target" || return 1
+  printf 'header = "X-Plex-Token: %s"\n' "$token" \
+    | curl -q --config - -sf --max-time "$seconds" \
+      --proto '=http,https' "${plex_headers[@]}" -- "$target"
+}
+
+valid_server_uri() {
+  local uri="$1"
+  [[ "$uri" == http://* || "$uri" == https://* ]] || return 1
+  # Server addresses contain no userinfo, credentials, fragments, or raw
+  # control characters. Query strings are used only for the fixed Plex API.
+  [[ "$uri" != *'@'* && "$uri" != *'#'* && "$uri" != *'\'* ]] || return 1
+  [[ ! "$uri" =~ [[:space:][:cntrl:]] ]] || return 1
+}
+
 # ---------------------------------------------------------------- discovery --
 
 # Pick the best reachable connection for each music-capable server.
 # Prefers local, non-relay, https-when-available; verifies with /identity.
 probe_connections() {
   local token="$1" resources server_json
-  resources="$(curl -sfL --max-time 20 "${plex_headers[@]}" \
-    -H "X-Plex-Token: $token" \
+  resources="$(authenticated_get "$token" 20 \
     "https://plex.tv/api/v2/resources?includeHttps=1&includeRelay=1")" \
     || fail "could not reach plex.tv to list your servers"
 
@@ -94,10 +121,9 @@ probe_connections() {
   while IFS=$'\t' read -r name stoken uri; do
     [[ -n "$uri" ]] || continue
     [[ -n "$stoken" ]] || stoken="$token"
-    machine="$(curl -sfL --max-time 6 \
-      -H "Accept: application/json" \
-      -H "X-Plex-Token: $stoken" \
-      "$uri/identity" 2>/dev/null | jq -r '.MediaContainer.machineIdentifier // empty')"
+    valid_server_uri "$uri" && [[ "$uri" != *'?'* ]] || continue
+    machine="$(authenticated_get "$stoken" 6 "$uri/identity" 2>/dev/null \
+      | jq -r '.MediaContainer.machineIdentifier // empty')"
     if [[ -n "$machine" ]]; then
       emit "$(jq -nc --arg n "$name" --arg u "$uri" '{stage:"server",name:$n,uri:$u}')"
       write_auth "$token" "$stoken" "$uri" "$name" "$machine"
@@ -112,9 +138,10 @@ probe_connections() {
 # "https://host:32400/") into something the server will actually answer on.
 normalize_uri() {
   local raw="$1" hostport
-  raw="$(printf '%s' "$raw" | tr -d '[:space:]')"
+  [[ "$raw" != *'?'* ]] || return 1
   [[ "$raw" == *"://"* ]] || raw="http://$raw"
   raw="${raw%/}"
+  valid_server_uri "$raw" || return 1
   hostport="${raw#*://}"
   hostport="${hostport%%/*}"
   # A bare host means the default Plex port.
@@ -122,20 +149,28 @@ normalize_uri() {
   printf '%s' "$raw"
 }
 
+# `replacing` is set by the subcommands that update an existing sign-in. If the
+# user signed out while one of them was still probing, the file is gone and the
+# stale result must not bring the credentials back.
 write_auth() {
   local account_token="$1" server_token="$2" uri="$3" name="$4" machine="$5" tmp
-  tmp="$(mktemp "$CONFIG_DIR/.auth.XXXXXX")"
-  jq -nc \
-    --arg at "$account_token" \
-    --arg st "$server_token" \
-    --arg uri "$uri" \
-    --arg name "$name" \
-    --arg machine "$machine" \
-    --arg cid "$CLIENT_ID" \
-    '{accountToken:$at, serverToken:$st, serverUri:$uri, serverName:$name,
-      machineIdentifier:$machine, clientIdentifier:$cid}' > "$tmp" || fail "could not write credentials"
-  chmod 600 "$tmp"
-  mv -f "$tmp" "$AUTH_FILE"
+  [[ -z "${replacing:-}" || -s "$AUTH_FILE" ]] || fail "signed out while checking the server"
+  tmp="$(mktemp "$CONFIG_DIR/.auth.XXXXXX")" || fail "could not create credentials file"
+  AUTH_TEMP="$tmp"
+  # NUL framing preserves literal quotes/newlines in metadata while keeping
+  # both tokens out of jq's process arguments.
+  if ! printf '%s\0' "$account_token" "$server_token" "$uri" "$name" "$machine" "$CLIENT_ID" \
+    | jq -Rsc 'split("\u0000") | {accountToken:.[0], serverToken:.[1],
+        serverUri:.[2], serverName:.[3], machineIdentifier:.[4],
+        clientIdentifier:.[5]}' > "$tmp"; then
+    rm -f "$tmp"
+    fail "could not write credentials"
+  fi
+  if ! chmod 600 "$tmp" || ! mv -f "$tmp" "$AUTH_FILE"; then
+    rm -f "$tmp"
+    fail "could not save credentials"
+  fi
+  AUTH_TEMP=""
 }
 
 # --------------------------------------------------------------------- main --
@@ -152,6 +187,7 @@ case "${1:-login}" in
 
   rediscover)
     [[ -s "$AUTH_FILE" ]] || fail "not signed in"
+    replacing=1
     token="$(jq -r '.accountToken // empty' "$AUTH_FILE")"
     [[ -n "$token" ]] || fail "not signed in"
     probe_connections "$token"
@@ -165,20 +201,19 @@ case "${1:-login}" in
     # no token -- the tokens stay in auth.json and are only ever read here.
     [[ -n "${2:-}" ]] || fail "no server address given"
     [[ -s "$AUTH_FILE" ]] || fail "not signed in"
+    replacing=1
     account="$(jq -r '.accountToken // empty' "$AUTH_FILE")"
     stored="$(jq -r '.serverToken // empty' "$AUTH_FILE")"
     name="$(jq -r '.serverName // "Plex"' "$AUTH_FILE")"
     [[ -n "$account$stored" ]] || fail "not signed in"
 
-    uri="$(normalize_uri "$2")"
+    uri="$(normalize_uri "$2")" || fail "invalid server address; use an HTTP or HTTPS host without credentials or a query"
     # The server token is scoped to one server, so fall back to the account
     # token when the new address turns out to be a different machine.
     for tok in "$stored" "$account"; do
       [[ -n "$tok" ]] || continue
-      machine="$(curl -sfL --max-time 8 \
-        -H "Accept: application/json" \
-        -H "X-Plex-Token: $tok" \
-        "$uri/identity" 2>/dev/null | jq -r '.MediaContainer.machineIdentifier // empty')"
+      machine="$(authenticated_get "$tok" 8 "$uri/identity" 2>/dev/null \
+        | jq -r '.MediaContainer.machineIdentifier // empty')"
       [[ -n "$machine" ]] || continue
       write_auth "$account" "$tok" "$uri" "$name" "$machine"
       emit "$(jq -nc --arg n "$name" --arg u "$uri" '{stage:"server",name:$n,uri:$u}')"
@@ -189,7 +224,7 @@ case "${1:-login}" in
     ;;
 
   logout)
-    rm -f "$AUTH_FILE"
+    rm -f "$AUTH_FILE" || fail "could not remove credentials"
     emit '{"stage":"logged-out"}'
     exit 0
     ;;
