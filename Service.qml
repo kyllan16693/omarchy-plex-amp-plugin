@@ -8,15 +8,10 @@ import "PlexApi.js" as PlexApi
 Item {
   id: root
 
-  // Injected by omarchy-shell when the service is instantiated.
-  property var shell: null
-  property var manifest: null
-  property string omarchyPath: ""
-  property var barWidgetRegistry: null
-  property var pluginRegistry: null
-
   readonly property string home: Quickshell.env("HOME") || ""
-  readonly property string pluginDir: manifest && manifest.__sourceDir ? String(manifest.__sourceDir) : ""
+  // The shell hands third-party plugins a manifest without its source
+  // directory, so the helpers are located relative to this file instead.
+  readonly property string pluginDir: String(Qt.resolvedUrl(".")).replace(/^file:\/\//, "").replace(/\/$/, "")
   readonly property string authScript: pluginDir ? pluginDir + "/bin/plexamp-auth" : ""
   readonly property string waveScript: pluginDir ? pluginDir + "/bin/plexamp-waveform" : ""
   readonly property string engineScript: pluginDir ? pluginDir + "/bin/plexamp-engine" : ""
@@ -161,6 +156,10 @@ Item {
 
   // ============================================================ credentials
 
+  // Bumped whenever the session changes so replies from the old one are
+  // dropped instead of repopulating the panel after a sign-out.
+  property int _sessionGeneration: 0
+
   FileView {
     id: authFile
     path: root.configDir + "/auth.json"
@@ -173,27 +172,28 @@ Item {
 
   function applyAuth(raw) {
     var text = String(raw || "").trim()
-    if (!text) {
-      if (authState !== "linking") authState = "logged-out"
-      serverUri = ""
-      serverToken = ""
-      serverName = ""
-      return
-    }
     var data = null
     try {
-      data = JSON.parse(text)
+      data = text ? JSON.parse(text) : null
     } catch (e) {
-      authState = "error"
-      authError = "credentials file is not valid JSON"
+      data = null
+    }
+    var valid = !!(data && data.serverUri && (data.serverToken || data.accountToken))
+    var uri = valid ? String(data.serverUri) : ""
+    var token = valid ? String(data.serverToken || data.accountToken) : ""
+    // Anything already loaded belongs to the old credentials.
+    if (serverUri && (uri !== serverUri || token !== serverToken)) clearSession()
+    if (!valid) {
+      if (text && !data) {
+        authState = "error"
+        authError = "credentials file is not valid JSON"
+      } else if (authState !== "linking") {
+        authState = "logged-out"
+      }
       return
     }
-    if (!data || !data.serverUri || !(data.serverToken || data.accountToken)) {
-      if (authState !== "linking") authState = "logged-out"
-      return
-    }
-    serverUri = String(data.serverUri)
-    serverToken = String(data.serverToken || data.accountToken)
+    serverUri = uri
+    serverToken = token
     serverName = String(data.serverName || "Plex")
     machineIdentifier = String(data.machineIdentifier || "")
     clientId = String(data.clientIdentifier || "")
@@ -220,9 +220,19 @@ Item {
     authProcess.running = true
   }
 
-  function logout() {
+  function clearSession() {
+    _sessionGeneration++
     stop()
     shutdownEngine()
+    waveQueue = []
+    if (waveProcess.running) waveProcess.signal(15)
+    waveProcess.streamUrl = ""
+    waveform = []
+    waveCache = ({})
+    restoreRetry.stop()
+    _playbackRestoring = false
+    loading = false
+    searching = false
     queue = []
     queueIndex = -1
     queueSource = ""
@@ -237,7 +247,20 @@ Item {
     musicSectionKey = ""
     clearSearch()
     clearBrowse()
+    _savedPlayback = null
+    serverUri = ""
+    serverToken = ""
+    serverName = ""
+    machineIdentifier = ""
+    clientId = ""
+  }
+
+  function logout() {
+    clearSession()
+    authState = "logged-out"
     if (authProcess.running) authProcess.signal(15)
+    if (serverProcess.running) serverProcess.signal(15)
+    serverBusy = false
     if (!authScript) return
     logoutProcess.command = [authScript, "logout"]
     logoutProcess.running = true
@@ -335,12 +358,6 @@ Item {
   Process {
     id: logoutProcess
     running: false
-    onExited: {
-      root.authState = "logged-out"
-      root.serverUri = ""
-      root.serverToken = ""
-      root.serverName = ""
-    }
   }
 
   function handleAuthMessage(msg) {
@@ -386,8 +403,10 @@ Item {
     var target = PlexApi.url(serverUri, path, query)
 
     var xhr = new XMLHttpRequest()
+    var generation = _sessionGeneration
     xhr.onreadystatechange = function () {
       if (xhr.readyState !== XMLHttpRequest.DONE) return
+      if (generation !== root._sessionGeneration) return
       if (xhr.status >= 200 && xhr.status < 300) {
         var parsed = null
         try {
@@ -813,6 +832,7 @@ Item {
     running: false
     stdinEnabled: true
     property string streamUrl: ""
+    property int sessionGeneration: 0
     onStarted: {
       write(streamUrl + "\n")
       streamUrl = ""
@@ -824,6 +844,7 @@ Item {
     stdout: SplitParser {
       splitMarker: "\n"
       onRead: function (line) {
+        if (waveProcess.sessionGeneration !== root._sessionGeneration) return
         var trimmed = String(line || "").trim()
         if (!trimmed) return
         var msg = null
@@ -899,6 +920,7 @@ Item {
     waveQueue = jobs
     waveJob = job
     waveProcess.streamUrl = job.stream
+    waveProcess.sessionGeneration = _sessionGeneration
     waveProcess.command = [waveScript, job.key]
     waveProcess.running = true
   }
@@ -933,70 +955,80 @@ Item {
 
   // ============================================================== mpv engine
 
-  // This helper only *starts* mpv. The player itself is detached by
-  // plexamp-engine so a Quickshell reload cannot take down playback.
+  // A detached supervisor keeps mpv through reloads and stops it when the
+  // plugin is disabled or removed from the persisted shell configuration.
+  // The launcher exits 0 only once the socket answers, which is when it is
+  // safe to connect: a Quickshell Socket that fails once never reconnects,
+  // so each attempt gets a fresh object.
+  property var ipc: null
+  function engineOnline() { return ipc !== null && ipc.connected === true }
+  property bool _wantEngine: false
+
   Process {
     id: engineProcess
     running: false
-    onStarted: connectTimer.restart()
-    onExited: if (root._wantEngine) connectTimer.restart()
+    stderr: SplitParser {
+      splitMarker: "\n"
+      onRead: function (line) {
+        if (String(line || "").trim() !== "") console.warn("plexamp/engine:", line)
+      }
+    }
+    onExited: function (code) {
+      if (!root._wantEngine) root.shutdownEngine()
+      else if (code === 0) root.connectEngine()
+      else root.playbackError = "could not start mpv"
+    }
   }
 
-  property bool _wantEngine: false
+  Process {
+    id: engineStopProcess
+    running: false
+  }
 
   function ensureEngine() {
     _wantEngine = true
-    if (ipc.connected) return true
+    if (engineOnline()) return true
     if (!socketPath) {
       playbackError = "XDG_RUNTIME_DIR is unavailable; cannot start mpv"
       return false
     }
     if (!engineProcess.running && engineScript) {
-      engineProcess.command = [engineScript, "start", root.socketPath, String(root.volume)]
+      engineProcess.command = [engineScript, "start", socketPath, String(volume),
+        home + "/.config/omarchy/shell.json"]
       engineProcess.running = true
     }
-    connectTimer.restart()
     return false
   }
 
-  Timer {
-    id: connectTimer
-    interval: 200
-    repeat: true
-    running: false
-    property int attempts: 0
-    onRunningChanged: if (running) attempts = 0
-    onTriggered: {
-      if (ipc.connected) {
-        stop()
-        return
-      }
-      attempts++
-      if (attempts > 50) {
-        stop()
-        root.playbackError = "could not connect to mpv"
-        return
-      }
-      ipc.connected = true
-    }
+  function connectEngine() {
+    if (!socketPath) return
+    if (ipc) ipc.destroy()
+    ipc = ipcComponent.createObject(root)
+    ipc.connected = true
   }
 
-  Socket {
-    id: ipc
-    path: root.socketPath
-    parser: SplitParser {
-      splitMarker: "\n"
-      onRead: function (line) { root.handleMpvLine(line) }
-    }
-    onConnectedChanged: {
-      if (connected) {
-        connectTimer.stop()
-        root.playbackError = ""
-        root.observeProperties()
-        root.flushPending()
-        root.tryRestorePlayback()
-      } else if (root._wantEngine) {
-        connectTimer.restart()
+  Component {
+    id: ipcComponent
+
+    Socket {
+      id: sock
+      path: root.socketPath
+      parser: SplitParser {
+        splitMarker: "\n"
+        onRead: function (line) { root.handleMpvLine(line) }
+      }
+      onConnectedChanged: {
+        if (root.ipc !== sock) return
+        if (connected) {
+          root.playbackError = ""
+          root.observeProperties()
+          root.flushPending()
+          root.tryRestorePlayback()
+        } else {
+          root.engineHasFile = false
+          root.isPlaying = false
+          positionTimer.stop()
+        }
       }
     }
   }
@@ -1016,7 +1048,7 @@ Item {
       _requests = next
     }
     var line = JSON.stringify(payload) + "\n"
-    if (ipc.connected) {
+    if (engineOnline()) {
       ipc.write(line)
     } else {
       var queued = _pending.slice()
@@ -1028,7 +1060,7 @@ Item {
   }
 
   function flushPending() {
-    if (!ipc.connected || !_pending.length) return
+    if (!engineOnline() || !_pending.length) return
     var items = _pending
     _pending = []
     for (var i = 0; i < items.length; i++) ipc.write(items[i])
@@ -1041,6 +1073,7 @@ Item {
     sendCommand(["observe_property", 4, "mute"])
     sendCommand(["observe_property", 5, "core-idle"])
     sendCommand(["observe_property", 6, "playlist-pos"])
+    sendCommand(["observe_property", 7, "idle-active"])
   }
 
   function handleMpvLine(line) {
@@ -1092,7 +1125,7 @@ Item {
   function applyProperty(name, data) {
     switch (name) {
     case "pause":
-      isPlaying = hasTrack && data === false
+      isPlaying = hasTrack && engineHasFile && data === false
       if (isPlaying) positionTimer.restart(); else positionTimer.stop()
       break
     case "duration":
@@ -1108,11 +1141,20 @@ Item {
       muted = data === true
       break
     case "core-idle":
-      engineHasFile = data === false
+      // True while paused, buffering, or idle; false only while sound plays.
+      if (data === false) {
+        engineHasFile = true
+        isPlaying = hasTrack
+        positionTimer.restart()
+      }
+      break
+    case "idle-active":
+      // mpv has no file at all: a cold start, or the end of the queue.
       if (data === true) {
+        engineHasFile = false
         isPlaying = false
         positionTimer.stop()
-      } else if (hasTrack) positionTimer.restart()
+      }
       break
     case "playlist-pos":
       // The playlist never holds more than [current, up-next], so mpv landing
@@ -1319,7 +1361,7 @@ Item {
     queuedKey = ""
     engineHasFile = false
     advanceGuard.stop()
-    if (ipc.connected) sendCommand(["stop"])
+    if (engineOnline()) sendCommand(["stop"])
     reportProgress("stopped")
   }
 
@@ -1328,9 +1370,13 @@ Item {
   // so it cannot keep a stream URL/token-bearing playlist in memory.
   function shutdownEngine() {
     _wantEngine = false
-    connectTimer.stop()
     _pending = []
-    if (ipc.connected) sendCommand(["quit"])
+    if (engineOnline()) sendCommand(["quit"])
+    // Also cover sign-out racing a launcher or a disconnected QML socket.
+    if (engineScript && socketPath && !engineStopProcess.running) {
+      engineStopProcess.command = [engineScript, "stop", socketPath]
+      engineStopProcess.running = true
+    }
   }
 
   function seek(seconds) {
@@ -1388,8 +1434,6 @@ Item {
   property bool _playbackRestored: false
   property bool _playbackRestoring: false
   property int _playbackRestoreAttempts: 0
-  // Used to upgrade older state files that included token-bearing stream URLs.
-  property var _pendingSanitizedPlayback: null
 
   FileView {
     id: stateFile
@@ -1404,16 +1448,12 @@ Item {
           root.volume = Math.max(0, Math.min(100, Math.round(data.volume)))
         if (data && data.sectionKey) root._savedSectionKey = String(data.sectionKey)
         if (data && data.prefs && typeof data.prefs === "object") root.prefs = data.prefs
-        if (data && data.playback && Array.isArray(data.playback.queue)) {
+        if (data && data.playback && Array.isArray(data.playback.queue))
           root._savedPlayback = root.sanitizePlayback(data.playback)
-          if (root.playbackHasSensitiveUrls(data.playback))
-            root._pendingSanitizedPlayback = root._savedPlayback
-        }
       } catch (e) {
         // A missing or corrupt state file just means defaults.
       }
       root._stateRead = true
-      root.writeSanitizedSavedState()
       root.tryRestorePlayback()
     }
     onLoadFailed: {
@@ -1430,7 +1470,7 @@ Item {
   // It never calls loadCurrent() here, which is what preserves the song and
   // its exact position.
   function tryRestorePlayback() {
-    if (_playbackRestored || _playbackRestoring || !_stateRead || !ipc.connected
+    if (_playbackRestored || _playbackRestoring || !_stateRead || !engineOnline()
         || !_savedPlayback || !ready)
       return
     var saved = _savedPlayback
@@ -1527,13 +1567,6 @@ Item {
     }
   }
 
-  function playbackHasSensitiveUrls(playback) {
-    var list = playback && playback.queue ? playback.queue : []
-    for (var i = 0; i < list.length; i++)
-      if (list[i] && (list[i].stream || list[i].art)) return true
-    return false
-  }
-
   function stateDocument(playback) {
     return JSON.stringify({
       volume: root.volume,
@@ -1541,19 +1574,6 @@ Item {
       prefs: root.prefs,
       playback: playback
     }, null, 2) + "\n"
-  }
-
-  function writeSanitizedSavedState() {
-    if (!_stateLoaded || !_pendingSanitizedPlayback) return
-    saveStateDocument(stateDocument(_pendingSanitizedPlayback))
-    _pendingSanitizedPlayback = null
-  }
-
-  function saveStateDocument(document) {
-    stateFile.setText(document)
-    // FileView writes atomically; allow that write to land before tightening
-    // the file too. The 0700 parent already prevents other-user access.
-    stateFileModeTimer.restart()
   }
 
   function persistState() {
@@ -1571,7 +1591,7 @@ Item {
   }
 
   function writeState() {
-    saveStateDocument(stateDocument({
+    stateFile.setText(stateDocument({
       queue: queueReferences(root.queue),
       queueIndex: root.queueIndex,
       queueSource: root.queueSource,
@@ -1587,48 +1607,26 @@ Item {
     onTriggered: root.writeState()
   }
 
+  // Nothing is written until the private state directory exists.
   Process {
-    id: mkdirProcess
+    id: stateDirProcess
     running: false
-    command: ["mkdir", "-p", root.stateDir]
-    onExited: stateModeProcess.running = true
-  }
-
-  Process {
-    id: stateModeProcess
-    running: false
-    command: ["chmod", "700", root.stateDir]
-    onExited: {
-      root._stateLoaded = true
-      root.writeSanitizedSavedState()
-    }
-  }
-
-  Timer {
-    id: stateFileModeTimer
-    interval: 100
-    repeat: false
-    onTriggered: stateFileModeProcess.running = true
-  }
-
-  Process {
-    id: stateFileModeProcess
-    running: false
-    command: ["chmod", "600", root.stateDir + "/state.json"]
+    command: ["install", "-d", "-m", "700", root.stateDir]
+    onExited: root._stateLoaded = true
   }
 
   Component.onCompleted: {
-    mkdirProcess.running = true
+    stateDirProcess.running = true
     stateFile.reload()
     authFile.reload()
-    // Attach after a refresh, but never create an idle detached player simply
-    // because the plugin has loaded.
-    if (socketPath) ipc.connected = true
+    // Attach to a player left running by a previous shell instance, but never
+    // create an idle one simply because the plugin has loaded.
+    connectEngine()
   }
 
   Component.onDestruction: {
-    // mpv intentionally outlives this QML object, including shell refreshes.
-    // Playback can be stopped explicitly through the normal transport APIs.
+    // The supervisor survives refreshes, and observes disable/removal even
+    // after this QML object and the installed helper files have disappeared.
     if (waveProcess.running) waveProcess.signal(15)
   }
 }
