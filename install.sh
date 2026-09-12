@@ -10,7 +10,7 @@ PLUGIN_ID="io.github.kyllan.ampbar"
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEST="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plugins/$PLUGIN_ID"
 
-# The only destructive operations below are constrained to this plugin's own
+# The only destructive operation below is constrained to this plugin's own
 # directory. Keep that invariant explicit if this script is ever refactored.
 case "$DEST" in
   */omarchy/plugins/"$PLUGIN_ID") ;;
@@ -28,24 +28,20 @@ echo "    to   $DEST"
 # live plugin folder makes the shell's watcher fire a reload per file, and it
 # has been seen to crash mid-reload under that storm. The dot prefix keeps the
 # staging directory out of the plugin scan while it fills up.
-STAGE="$(dirname "$DEST")/.$PLUGIN_ID.installing"
-[[ "$STAGE" != "$DEST" ]] || { echo "staging path overlaps destination" >&2; exit 2; }
 mkdir -p "$(dirname "$DEST")"
-rm -rf "$STAGE"
-mkdir -p "$STAGE"
+STAGE="$(mktemp -d "$(dirname "$DEST")/.$PLUGIN_ID.installing.XXXXXX")"
+trap 'rm -rf "$STAGE"' EXIT
+chmod 755 "$STAGE"
 
 # Only ship what the shell needs. Anything not listed here stays in the repo.
-cp "$SRC/manifest.json" "$STAGE/"
-cp "$SRC"/*.qml "$STAGE/"
-cp "$SRC"/*.js "$STAGE/"
-cp "$SRC/README.md" "$STAGE/" 2>/dev/null || true
-
+cp "$SRC/manifest.json" "$SRC"/*.qml "$SRC"/*.js "$SRC/preview.png" \
+  "$SRC/README.md" "$SRC/LICENSE" "$SRC/COPYRIGHT" \
+  "$SRC/THIRD_PARTY_NOTICES.md" "$SRC/PRIVACY.md" "$STAGE/"
+mkdir -p "$STAGE/assets"
+cp -R "$SRC/assets/screenshots" "$STAGE/assets/"
 mkdir -p "$STAGE/bin"
-for helper in "$SRC"/bin/*; do
-  [ -f "$helper" ] || continue
-  cp "$helper" "$STAGE/bin/"
-  chmod +x "$STAGE/bin/$(basename "$helper")"
-done
+cp "$SRC"/bin/* "$STAGE/bin/"
+chmod +x "$STAGE"/bin/*
 
 if command -v omarchy >/dev/null 2>&1; then
   echo "==> Validating"
@@ -54,6 +50,7 @@ fi
 
 rm -rf "$DEST"
 mv "$STAGE" "$DEST"
+trap - EXIT
 
 if command -v omarchy-shell >/dev/null 2>&1; then
   echo "==> Rescanning plugins"
