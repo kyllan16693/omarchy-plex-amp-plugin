@@ -53,6 +53,10 @@ class CredentialTransportTests(unittest.TestCase):
                                          'stdin': config, 'env': dict(os.environ)}) + '\\n')
             if sys.argv[-1].endswith('/api/v2/pins') and os.environ.get('AMPBAR_TEST_PIN'):
                 print(os.environ['AMPBAR_TEST_PIN'])
+            elif '/resources?' in sys.argv[-1] and os.environ.get('AMPBAR_TEST_RESOURCES'):
+                print(os.environ['AMPBAR_TEST_RESOURCES'])
+            elif '/identity' in sys.argv[-1] and os.environ.get('AMPBAR_TEST_UNREACHABLE'):
+                sys.exit(7)
             elif '/resources?' in sys.argv[-1]:
                 print(json.dumps([{'name': 'Synthetic library', 'provides': 'server',
                     'accessToken': 'SYNTHETIC_SERVER_TOKEN', 'owned': True,
@@ -149,6 +153,24 @@ class CredentialTransportTests(unittest.TestCase):
                 self.assertIn('unexpected sign-in code', result.stdout)
                 self.assertNotIn('"stage":"pin"', result.stdout)
                 self.assertFalse(marker.exists(), 'plex.tv data was executed')
+        pins = [c for c in self.calls() if c['tool'] == 'curl' and c['argv'][-1].endswith('/pins')]
+        self.assertTrue(pins)
+        for call in pins:
+            self.assertIn('--proto-redir', call['argv'])
+            self.assertIn('--max-filesize', call['argv'])
+
+    def test_server_discovery_stops_after_25_connections(self):
+        # Every probe can take six seconds; plex.tv decides how many there are.
+        connections = [{'uri': f'https://s{i}.plex.invalid:32400', 'local': False,
+                        'protocol': 'https'} for i in range(40)]
+        resources = [{'name': 'x' * 5000, 'provides': 'server', 'accessToken': SERVER_TOKEN,
+                      'owned': True, 'connections': connections}]
+        env = dict(self.env, AMPBAR_TEST_RESOURCES=json.dumps(resources), AMPBAR_TEST_UNREACHABLE='1')
+        result = subprocess.run([str(REPO / 'bin/plexamp-auth'), 'rediscover'], env=env,
+                                capture_output=True, text=True, timeout=30)
+        self.assertNotEqual(result.returncode, 0)
+        probes = [c for c in self.calls() if c['tool'] == 'curl' and c['argv'][-1].endswith('/identity')]
+        self.assertEqual(len(probes), 25)
 
     def test_logout_removes_credentials(self):
         result = self.run_auth('logout')
@@ -398,6 +420,7 @@ class PlexApiBoundsTests(unittest.TestCase):
                         r'^  function loadArtwork\([^]*?^  }$',
                         r'^  function clearArtwork\([^]*?^  }$',
                         r'^  function base64\([^]*?^  }$',
+                        r'^  function validPeaks\([^]*?^  }$',
                         r'^  function expireRequests\([^]*?^  }$',
                         r'^  function cancelRequests\([^]*?^  }$',
                         r'^  Timer \{\n    id: requestDeadline[^]*?^  }$'):
@@ -559,6 +582,57 @@ class PlexApiBoundsTests(unittest.TestCase):
         expected = [base64.b64encode(v).decode() for v in
                     (b'', b'f', b'fo', b'foo', b'foob', b'fooba', b'foobar', bytes(range(256)))]
         self.assertEqual(encoded, expected)
+
+    def test_only_well_formed_waveforms_are_drawn(self):
+        output = self.run_qml([], extra=textwrap.dedent('''\
+              Timer {
+                interval: 1
+                running: true
+                onTriggered: {
+                  var good = []
+                  for (var i = 0; i < 120; i++) good.push(i / 119)
+                  var huge = []
+                  for (var j = 0; j < 100000; j++) huge.push(0.5)
+                  var cases = [good, good.slice(1), huge, good.map(function (v) { return v * 2 }),
+                               good.map(function (v, k) { return k === 3 ? "0.5" : v }),
+                               good.map(function (v, k) { return k === 3 ? NaN : v }), null, {}]
+                  console.log("PEAKS " + JSON.stringify(cases.map(root.validPeaks)))
+                  Qt.quit()
+                }
+              }'''))
+        verdicts = json.loads(output.split('PEAKS ', 1)[1].splitlines()[0])
+        self.assertEqual(verdicts, [True, False, False, False, False, False, False, False])
+
+    def test_failed_covers_do_not_accumulate(self):
+        output = self.run_qml([], extra=textwrap.dedent('''\
+              Timer {
+                interval: 1
+                running: true
+                onTriggered: {
+                  // 1,500 covers that failed over five minutes ago, then one more.
+                  var long_ago = Date.now() - root.artRetryMs - 1000
+                  for (var i = 0; i < 1500; i++) root._art["http://gone.invalid/" + i] = { data: "", at: long_ago }
+                  root._art["http://gone.invalid/recent"] = { data: "", at: Date.now() }
+                  root.loadArtwork("http://127.0.0.2:9/foreign.jpg")
+                  console.log("KEYS " + Object.keys(root._art).length)
+                  Qt.quit()
+                }
+              }'''))
+        # The stale failures go; the recent one and the new entry stay.
+        self.assertEqual(output.split('KEYS ', 1)[1].split()[0], '2')
+
+    def test_every_label_renders_plain_text(self):
+        # Qt's default AutoText renders markup in server-supplied titles, and
+        # <img src> in a track name would fetch outside every bound here.
+        for name in ('Panel.qml', 'PlexSettings.qml', 'SeekBar.qml', 'PlexPanel.qml'):
+            lines = (REPO / name).read_text().splitlines()
+            for i, line in enumerate(lines):
+                if re.match(r'^\s*Text \{', line):
+                    with self.subTest(file=name, line=i + 1):
+                        self.assertEqual(lines[i + 1].strip(), 'textFormat: Text.PlainText')
+            for line in lines:
+                self.assertNotIn('Text.RichText', line)
+                self.assertNotIn('Text.StyledText', line)
 
     def test_panel_never_hands_image_a_remote_url(self):
         # Every cover in the panel must come through Service.artwork(), which

@@ -101,7 +101,7 @@ fi
 
 peaks="$(
   timeout 90 nice -n 19 ffmpeg -v error -nostdin -i "$media" -ac 1 -ar 4000 -f s16le - 2>/dev/null \
-  | BUCKETS="$BUCKETS" MAX_SAMPLES="$((MAX_SECONDS * 4000))" python3 -c '
+  | BUCKETS="$BUCKETS" MAX_SAMPLES="$((MAX_SECONDS * 4000))" nice -n 19 python3 -c '
 import sys, os, math, json
 from array import array
 

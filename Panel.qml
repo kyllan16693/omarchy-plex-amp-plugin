@@ -736,6 +736,7 @@ Panel {
               }
 
               Text {
+                textFormat: Text.PlainText
                 id: tabLabel
                 anchors.centerIn: parent
                 text: tabItem.modelData
@@ -759,6 +760,7 @@ Panel {
 
           // Only worth showing when the server actually has more than one.
           Text {
+            textFormat: Text.PlainText
             visible: root.plex && root.plex.musicSections.length > 1
             text: (root.plex ? root.plex.musicSectionTitle : "") + "  ⇅"
             color: root.dimmer
@@ -791,6 +793,7 @@ Panel {
           }
 
           Text {
+            textFormat: Text.PlainText
             text: "h  back"
             color: root.dimmer
             font.family: root.fontFamily
@@ -905,6 +908,7 @@ Panel {
                 }
 
                 Text {
+                  textFormat: Text.PlainText
                   anchors.centerIn: parent
                   visible: rowItem.kind === "station"
                   text: "󰐻"
@@ -928,6 +932,7 @@ Panel {
                 spacing: 0
 
                 Text {
+                  textFormat: Text.PlainText
                   Layout.fillWidth: true
                   text: rowItem.item ? rowItem.item.title : ""
                   color: rowItem.isCurrent ? root.accent : root.foreground
@@ -937,6 +942,7 @@ Panel {
                 }
 
                 Text {
+                  textFormat: Text.PlainText
                   Layout.fillWidth: true
                   text: {
                     if (!rowItem.item) return ""
@@ -957,6 +963,7 @@ Panel {
               }
 
               Text {
+                textFormat: Text.PlainText
                 Layout.alignment: Qt.AlignVCenter
                 text: {
                   if (!rowItem.item) return ""
@@ -994,6 +1001,7 @@ Panel {
 
           // Empty states: never leave the list looking broken.
           Text {
+            textFormat: Text.PlainText
             anchors.centerIn: parent
             width: parent.width - Style.space(24)
             horizontalAlignment: Text.AlignHCenter
@@ -1020,6 +1028,7 @@ Panel {
         // --------------------------------------------------------- footer --
 
         Text {
+          textFormat: Text.PlainText
           Layout.fillWidth: true
           visible: root.authState === "ready" && root.showHints
           text: {
@@ -1077,6 +1086,7 @@ Panel {
         }
 
         Text {
+          textFormat: Text.PlainText
           Layout.fillWidth: true
           horizontalAlignment: Text.AlignHCenter
           text: root.track ? root.track.title : "Nothing playing"
@@ -1087,6 +1097,7 @@ Panel {
         }
 
         Text {
+          textFormat: Text.PlainText
           Layout.fillWidth: true
           horizontalAlignment: Text.AlignHCenter
           text: root.track ? (root.track.artist + (root.track.album ? "  ·  " + root.track.album : "")) : ""
@@ -1200,6 +1211,7 @@ Panel {
           }
 
           Text {
+            textFormat: Text.PlainText
             anchors.right: parent.right
             anchors.verticalCenter: parent.verticalCenter
             text: (root.plex ? root.plex.upNext.length : 0)
@@ -1261,6 +1273,7 @@ Panel {
               }
 
               Text {
+                textFormat: Text.PlainText
                 Layout.fillWidth: true
                 text: upNextRow.modelData
                   ? (upNextRow.modelData.title + "  ·  " + upNextRow.modelData.artist) : ""
@@ -1282,6 +1295,7 @@ Panel {
         }
 
         Text {
+          textFormat: Text.PlainText
           Layout.fillWidth: true
           visible: root.showHints
           horizontalAlignment: Text.AlignHCenter
@@ -1394,6 +1408,7 @@ Panel {
           spacing: Style.space(4)
 
           Text {
+            textFormat: Text.PlainText
             Layout.alignment: Qt.AlignHCenter
             text: root.plex ? root.plex.pinCode : ""
             color: root.accent
@@ -1404,6 +1419,7 @@ Panel {
           }
 
           Text {
+            textFormat: Text.PlainText
             Layout.alignment: Qt.AlignHCenter
             text: "Enter this code at plex.tv/link"
             color: root.dim
@@ -1421,6 +1437,7 @@ Panel {
       }
 
       Text {
+        textFormat: Text.PlainText
         Layout.fillWidth: true
         horizontalAlignment: Text.AlignHCenter
         visible: root.authState !== "linking"
@@ -1431,6 +1448,7 @@ Panel {
       }
 
       Text {
+        textFormat: Text.PlainText
         Layout.fillWidth: true
         horizontalAlignment: Text.AlignHCenter
         visible: root.authState === "linking"
@@ -1496,6 +1514,7 @@ Panel {
               color: Qt.rgba(0, 0, 0, 0.35)
 
               Text {
+                textFormat: Text.PlainText
                 anchors.centerIn: parent
                 text: "󰊓"
                 color: "white"
@@ -1512,6 +1531,7 @@ Panel {
           spacing: Style.space(2)
 
           Text {
+            textFormat: Text.PlainText
             Layout.fillWidth: true
             text: root.track ? root.track.title : "Nothing playing"
             color: root.foreground
@@ -1521,6 +1541,7 @@ Panel {
           }
 
           Text {
+            textFormat: Text.PlainText
             Layout.fillWidth: true
             text: root.track ? root.track.artist : (root.plex ? root.plex.serverName : "")
             color: root.dim
@@ -1530,6 +1551,7 @@ Panel {
           }
 
           Text {
+            textFormat: Text.PlainText
             Layout.fillWidth: true
             text: {
               if (!root.track) return ""
@@ -1650,6 +1672,7 @@ Panel {
         visible: root.hasTrack && !root.browsing
 
         Text {
+          textFormat: Text.PlainText
           text: "a  more from " + (root.track ? root.track.artist : "")
           color: root.dimmer
           font.family: root.fontFamily
@@ -1665,6 +1688,7 @@ Panel {
         }
 
         Text {
+          textFormat: Text.PlainText
           text: "d  this album"
           color: root.dimmer
           font.family: root.fontFamily

@@ -558,6 +558,16 @@ Item {
 
   function loadArtwork(url) {
     var entry = { data: "", at: Date.now() }
+    // Failed covers keep an empty entry to hold off retries. Drop those once
+    // they have waited out the retry period, so a radio session visiting
+    // thousands of albums can't grow the map without end.
+    var keys = Object.keys(_art)
+    if (keys.length > 1000) {
+      for (var i = 0; i < keys.length; i++) {
+        var old = _art[keys[i]]
+        if (!old.data && entry.at - old.at >= artRetryMs) delete _art[keys[i]]
+      }
+    }
     _art[url] = entry
     // Covers only ever come from the signed-in server.
     if (!serverUri || String(url).indexOf(serverUri + "/") !== 0) return
@@ -1022,10 +1032,21 @@ Item {
         } catch (e) {
           return
         }
-        if (msg.stage !== "waveform" || !Array.isArray(msg.peaks)) return
+        if (msg.stage !== "waveform" || !root.validPeaks(msg.peaks)) return
         root.rememberWaveform(String(msg.ratingKey), msg.peaks)
       }
     }
+  }
+
+  // The helper always draws 120 buckets in [0, 1]; a cache file of any other
+  // shape, however it got there, is ignored rather than drawn.
+  function validPeaks(peaks) {
+    if (!Array.isArray(peaks) || peaks.length !== 120) return false
+    for (var i = 0; i < peaks.length; i++) {
+      var v = peaks[i]
+      if (typeof v !== "number" || !(v >= 0 && v <= 1)) return false
+    }
+    return true
   }
 
   function rememberWaveform(key, peaks) {
@@ -1166,7 +1187,7 @@ Item {
     }
     if (!engineProcess.running && engineScript) {
       engineProcess.command = [engineScript, "start", socketPath, String(volume),
-        home + "/.config/omarchy/shell.json"]
+        (Quickshell.env("XDG_CONFIG_HOME") || (home + "/.config")) + "/omarchy/shell.json"]
       engineProcess.running = true
     }
     return false

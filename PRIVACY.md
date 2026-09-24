@@ -26,7 +26,7 @@ deleted once the waveform is built. Artwork URLs carry the token too, as Plex
 requires; covers are fetched through the same size- and time-bounded requests
 as library data and handed to the image loader as in-memory image data, so the
 URL never reaches Quickshell's image loader or its log. The mpv IPC socket
-lives under the same private directory. Authentication tokens reach curl and jq through stdin, without
+lives in the per-user runtime directory (`$XDG_RUNTIME_DIR`, mode `0700`). Authentication tokens reach curl and jq through stdin, without
 appearing in process arguments or exported environment variables.
 Authenticated curl requests do not follow redirects.
 
