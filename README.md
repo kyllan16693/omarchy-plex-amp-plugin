@@ -46,7 +46,7 @@ Radio — seeded and library stations:
 ## Install
 
 ```sh
-omarchy plugin add https://github.com/kyllan/ampbar-for-plex-omarchy.git --enable
+omarchy plugin add https://github.com/kyllan16693/omarchy-plex-amp-plugin.git --enable
 ```
 
 Omarchy clones, validates, and enables the plugin. Add the **Ampbar for Plex** widget to your bar from

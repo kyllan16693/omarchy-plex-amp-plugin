@@ -213,7 +213,7 @@ import os, sys
 from pathlib import Path
 real = Path(__file__).with_name('plexamp-engine-real')
 args = sys.argv[1:4]
-if args[0] != 'stop':
+if args[0] == 'start':
     args += [str(Path(os.environ['AMPBAR_SMOKE_BASE']) / 'config/omarchy/shell.json')]
 os.execv(str(real), [str(real), *args])
 """)

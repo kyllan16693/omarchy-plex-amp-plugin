@@ -76,6 +76,11 @@ esac
 umask 077
 mkdir -p "$STATE_DIR" || true
 chmod 700 "$STATE_DIR" 2>/dev/null || true
+# The EXIT trap below can't run if a previous analysis was SIGKILLed, and its
+# download may be up to the byte cap. No run lasts more than about three
+# minutes, so anything an hour old is abandoned.
+find "$STATE_DIR" -maxdepth 1 -type f \( -name '.request.*' -o -name '.media.*' -o -name '.wave.*' \) \
+  -mmin +60 -delete 2>/dev/null || true
 
 request_config="$(mktemp "$STATE_DIR/.request.XXXXXX")" || exit 1
 media="$(mktemp "$STATE_DIR/.media.XXXXXX")" || { rm -f "$request_config"; exit 1; }

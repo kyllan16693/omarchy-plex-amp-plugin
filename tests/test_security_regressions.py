@@ -206,7 +206,7 @@ class WaveformBoundsTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.state = Path(self.temp.name) / 'omarchy/plexamp/waveform'
 
-    def run_waveform(self, path, bin_dir=None, **limits):
+    def run_waveform(self, path, bin_dir=None, left_behind=(), **limits):
         env = dict(os.environ, XDG_STATE_HOME=self.temp.name)
         if bin_dir:
             env['PATH'] = str(bin_dir) + os.pathsep + env['PATH']
@@ -215,7 +215,7 @@ class WaveformBoundsTests(unittest.TestCase):
                                 input=self.base + path + '?X-Plex-Token=' + SERVER_TOKEN + '\n',
                                 capture_output=True, text=True, timeout=60)
         self.assertNotIn(SERVER_TOKEN, result.stdout + result.stderr)
-        self.assertEqual([p.name for p in self.state.glob('.*')], [])
+        self.assertEqual(sorted(p.name for p in self.state.glob('.*')), sorted(left_behind))
         return result, json.loads(result.stdout)
 
     def test_track_within_limits_is_analysed_and_cached(self):
@@ -279,6 +279,17 @@ class WaveformBoundsTests(unittest.TestCase):
         self.assertEqual(message['stage'], 'waveform')
         self.assertEqual(sorted(p.name for p in self.state.glob('*.json')),
                          ['10.json', '42.json', '9.json'])
+
+    def test_leftovers_from_a_killed_analysis_are_swept(self):
+        self.state.mkdir(parents=True)
+        old, fresh = self.state / '.media.abandoned', self.state / '.media.running'
+        for leftover in (old, fresh):
+            leftover.write_bytes(b'x' * 1024)
+        os.utime(old, (time.time() - 7200, time.time() - 7200))
+        # An hour-old download is abandoned; a recent one may be a live run.
+        result, message = self.run_waveform('/track', left_behind=['.media.running'])
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(message['stage'], 'waveform')
 
     def test_limits_cannot_be_raised_from_the_environment(self):
         source = (REPO / 'bin/plexamp-waveform').read_text()

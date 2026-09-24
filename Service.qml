@@ -1792,8 +1792,26 @@ Item {
     stateFile.reload()
     authFile.reload()
     // Attach to a player left running by a previous shell instance, but never
-    // create an idle one simply because the plugin has loaded.
-    connectEngine()
+    // create an idle one simply because the plugin has loaded. The engine
+    // vets the socket first, as it does before every other connect.
+    if (engineScript && socketPath) {
+      attachProcess.command = [engineScript, "check", socketPath]
+      attachProcess.running = true
+    }
+  }
+
+  Process {
+    id: attachProcess
+    running: false
+    stderr: SplitParser {
+      splitMarker: "\n"
+      onRead: function (line) {
+        if (String(line || "").trim() !== "") console.warn("plexamp/engine:", line)
+      }
+    }
+    onExited: function (code) {
+      if (code === 0 && !root.ipc) root.connectEngine()
+    }
   }
 
   Component.onDestruction: {
