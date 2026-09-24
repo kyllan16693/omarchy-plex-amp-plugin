@@ -254,8 +254,9 @@ the player stops.
 
 Library, search, and play-queue requests run inside the shell, so each one is
 bounded too: a reply must arrive within 30 seconds in total and stay under
-16 MiB (about 12,000 tracks' worth), or the request is aborted and reported as
-an error rather than parsed. Signing out cancels anything still in flight.
+16 MiB (about 12,000 tracks' worth), and everything in flight together must stay
+under 32 MiB, or the request is aborted and reported as an error rather than
+parsed. Signing out or unloading the plugin cancels anything still in flight.
 
 ## The waveform
 

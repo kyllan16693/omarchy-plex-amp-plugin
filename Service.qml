@@ -398,9 +398,12 @@ Item {
   // request is bounded in time and size. A server that stalls, trickles, or
   // streams without end is cut off instead of holding a socket open or
   // growing the shell's memory. Plex spends about 1.4 KB per track, so the
-  // cap still fits an artist's /allLeaves of some 12,000 tracks.
+  // cap still fits an artist's /allLeaves of some 12,000 tracks. Opening the
+  // panel sends several requests at once, so everything in flight also shares
+  // one budget: many replies each just under the cap cannot add up either.
   readonly property int apiTimeoutMs: 30000
   readonly property int apiMaxResponseBytes: 16 * 1024 * 1024
+  readonly property int apiMaxInFlightBytes: 32 * 1024 * 1024
   property var _pendingRequests: []
 
   function apiRequest(method, path, params, onSuccess, onFailure) {
@@ -414,22 +417,29 @@ Item {
 
     var xhr = new XMLHttpRequest()
     var generation = _sessionGeneration
-    var pending = { xhr: xhr, deadline: Date.now() + apiTimeoutMs, error: "" }
+    var pending = { xhr: xhr, deadline: Date.now() + apiTimeoutMs, bytes: 0, error: "" }
     // Qt keeps using the network reply after a readystatechange handler
-    // returns, so aborting from inside one crashes the shell. The abort waits
-    // for the handler to unwind; the reason is recorded now, and DONE (from
-    // abort() or a reply that finishes first) reports it.
-    function cancel(error) {
+    // returns, so aborting from inside one crashes the shell. From a handler
+    // the abort waits for it to unwind; the timer, sign-out, and teardown
+    // abort at once. The reason is recorded first, and DONE (from abort() or
+    // a reply that finishes first) reports it.
+    function cancel(error, immediately) {
       if (pending.error) return
       pending.error = error
-      Qt.callLater(function () { xhr.abort() })
+      if (immediately) xhr.abort()
+      else Qt.callLater(function () { xhr.abort() })
     }
     pending.cancel = cancel
     function tooLarge() {
       // An arraybuffer response exposes the bytes received so far without
       // copying or decoding them, which makes this check cheap per chunk.
       var body = xhr.response
-      return !!body && body.byteLength > root.apiMaxResponseBytes
+      pending.bytes = body ? body.byteLength : 0
+      if (pending.bytes > root.apiMaxResponseBytes) return true
+      var total = 0
+      for (var i = 0; i < root._pendingRequests.length; i++)
+        total += root._pendingRequests[i].bytes
+      return total > root.apiMaxInFlightBytes
     }
     xhr.onreadystatechange = function () {
       if (xhr.readyState === XMLHttpRequest.HEADERS_RECEIVED) {
@@ -444,13 +454,15 @@ Item {
       if (xhr.readyState !== XMLHttpRequest.DONE) return
       var at = root._pendingRequests.indexOf(pending)
       if (at >= 0) root._pendingRequests.splice(at, 1)
+      if (!root._pendingRequests.length) requestDeadline.stop()
       if (generation !== root._sessionGeneration) return
       if (pending.error) {
         if (onFailure) onFailure(pending.error)
         return
       }
-      // The final chunk can arrive together with DONE.
-      if (tooLarge()) {
+      // The final chunk can arrive together with DONE. This reply has left
+      // the shared budget, so only its own cap applies now.
+      if (xhr.response && xhr.response.byteLength > root.apiMaxResponseBytes) {
         if (onFailure) onFailure("response from Plex was too large")
         return
       }
@@ -473,7 +485,7 @@ Item {
     xhr.setRequestHeader("Accept", "application/json")
     if (clientId) xhr.setRequestHeader("X-Plex-Client-Identifier", clientId)
     _pendingRequests.push(pending)
-    requestDeadline.start()
+    requestDeadline.running = true
     xhr.send()
   }
 
@@ -482,13 +494,14 @@ Item {
   function expireRequests(now) {
     var expired = _pendingRequests.filter(function (p) { return now >= p.deadline })
     for (var i = 0; i < expired.length; i++)
-      expired[i].cancel("Plex took too long to respond")
+      expired[i].cancel("Plex took too long to respond", true)
     if (!_pendingRequests.length) requestDeadline.stop()
   }
 
+  // Never called from inside a request's own handler, so it aborts at once.
   function cancelRequests() {
     var all = _pendingRequests.slice()
-    for (var i = 0; i < all.length; i++) all[i].cancel("cancelled")
+    for (var i = 0; i < all.length; i++) all[i].cancel("cancelled", true)
   }
 
   Timer {
@@ -1697,6 +1710,9 @@ Item {
   }
 
   Component.onDestruction: {
+    // The deadline timer dies with this object, so nothing would bound a
+    // request left running.
+    cancelRequests()
     // The supervisor survives refreshes, and observes disable/removal even
     // after this QML object and the installed helper files have disappeared.
     if (waveProcess.running) waveProcess.signal(15)

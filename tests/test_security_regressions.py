@@ -289,6 +289,15 @@ class _PlexApiHandler(http.server.BaseHTTPRequestHandler):
                     self.wfile.write(b'%x\r\n' % len(chunk) + chunk + b'\r\n')
                     self.wfile.flush()
                     time.sleep(0.001)
+            elif path == '/stall':
+                # 700 KiB, under the per-request cap, then nothing more.
+                self.send_response(200)
+                self.send_header('Transfer-Encoding', 'chunked')
+                self.end_headers()
+                chunk = b' ' * (700 * 1024)
+                self.wfile.write(b'%x\r\n' % len(chunk) + chunk + b'\r\n')
+                self.wfile.flush()
+                time.sleep(15)
             elif path == '/trickle':
                 # One byte a fifth of a second: never idle, never finishing.
                 self.send_response(200)
@@ -307,6 +316,7 @@ class PlexApiBoundsTests(unittest.TestCase):
     """Service.qml's real request code, run under Qt against a hostile server."""
     TIMEOUT_MS = 2000
     MAX_BYTES = 1024 * 1024
+    MAX_IN_FLIGHT = 2 * 1024 * 1024
 
     @classmethod
     def setUpClass(cls):
@@ -320,7 +330,7 @@ class PlexApiBoundsTests(unittest.TestCase):
         cls.server.shutdown()
         cls.server.server_close()
 
-    def harness(self, directory, paths):
+    def harness(self, directory, labels, extra=''):
         source = (REPO / 'Service.qml').read_text()
         pieces = []
         for pattern in (r'^  function apiRequest\([^]*?^  }$',
@@ -343,40 +353,48 @@ class PlexApiBoundsTests(unittest.TestCase):
               property int _sessionGeneration: 0
               readonly property int apiTimeoutMs: %(timeout)d
               readonly property int apiMaxResponseBytes: %(cap)d
+              readonly property int apiMaxInFlightBytes: %(budget)d
               property var _pendingRequests: []
               property int outstanding: %(count)d
-              function report(path, started, outcome) {
-                console.log("RESULT " + JSON.stringify({ path: path, ms: Date.now() - started,
+              // A label is a path plus an optional "#n", so one path can be
+              // requested several times at once.
+              function report(label, started, outcome) {
+                console.log("RESULT " + JSON.stringify({ path: label, ms: Date.now() - started,
                                                          outcome: outcome }))
                 if (--outstanding === 0) Qt.quit()
               }
               Component.onCompleted: {
-                var paths = %(paths)s
-                paths.forEach(function (path) {
+                var labels = %(labels)s
+                labels.forEach(function (label) {
                   var started = Date.now()
-                  root.apiRequest("GET", path, {},
-                    function (json) { root.report(path, started, "ok " + JSON.stringify(json)) },
-                    function (error) { root.report(path, started, "failed " + error) })
+                  root.apiRequest("GET", label.split("#")[0], {},
+                    function (json) { root.report(label, started, "ok " + JSON.stringify(json)) },
+                    function (error) { root.report(label, started, "failed " + error) })
                 })
               }
             ''') % {'base': json.dumps(self.base), 'timeout': self.TIMEOUT_MS,
-                    'cap': self.MAX_BYTES, 'count': len(paths), 'paths': json.dumps(paths)}
-            + '\n\n'.join(pieces) + '\n}\n')
+                    'cap': self.MAX_BYTES, 'budget': self.MAX_IN_FLIGHT,
+                    'count': len(labels), 'labels': json.dumps(labels)}
+            + '\n\n'.join(pieces + [extra]) + '\n}\n')
         return directory / 'harness.qml'
 
-    def run_requests(self, *paths):
+    def run_qml(self, labels, extra=''):
         with tempfile.TemporaryDirectory(prefix='ampbar-api-') as temp:
-            qml = self.harness(Path(temp), list(paths))
+            qml = self.harness(Path(temp), list(labels), extra)
             env = dict(os.environ, QT_QPA_PLATFORM='offscreen', QT_FORCE_STDERR_LOGGING='1')
             result = subprocess.run([shutil.which('qml6') or shutil.which('qml'), str(qml)],
                                     env=env, capture_output=True, text=True, timeout=30)
-        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return result.stdout + result.stderr
+
+    def run_requests(self, *labels):
+        output = self.run_qml(labels)
         results = {}
         for line in output.splitlines():
             if 'RESULT ' in line:
                 entry = json.loads(line.split('RESULT ', 1)[1])
                 results[entry['path']] = entry
-        self.assertEqual(sorted(results), sorted(paths), output)
+        self.assertEqual(sorted(results), sorted(labels), output)
         return results
 
     def test_bounded_replies_are_parsed_and_hostile_ones_refused(self):
@@ -390,11 +408,49 @@ class PlexApiBoundsTests(unittest.TestCase):
         for path in ('/declared', '/endless'):
             self.assertLess(results[path]['ms'], self.TIMEOUT_MS)
 
+    def test_replies_under_the_cap_share_one_budget(self):
+        # Four 700 KiB replies are each allowed alone, but together they pass
+        # the 2 MiB in-flight budget; whichever pushes it over is refused.
+        labels = ['/stall#%d' % i for i in range(4)]
+        results = self.run_requests(*labels)
+        outcomes = [results[label]['outcome'] for label in labels]
+        refused = [label for label in labels
+                   if results[label]['outcome'] == 'failed response from Plex was too large']
+        self.assertTrue(refused, outcomes)
+        for label in refused:
+            self.assertLess(results[label]['ms'], self.TIMEOUT_MS)
+        for label in set(labels) - set(refused):
+            self.assertEqual(results[label]['outcome'], 'failed Plex took too long to respond')
+
+    def test_sign_out_aborts_requests_in_flight(self):
+        # What clearSession() does: bump the generation, then cancel. Nothing
+        # may call back afterwards, and nothing may be left in flight.
+        output = self.run_qml(['/trickle#1', '/trickle#2'], extra=textwrap.dedent('''\
+              Timer {
+                interval: 300
+                running: true
+                onTriggered: {
+                  root._sessionGeneration++
+                  root.cancelRequests()
+                  console.log("LEFT " + root._pendingRequests.length + " " + requestDeadline.running)
+                  Qt.callLater(Qt.quit)
+                }
+              }'''))
+        self.assertIn('LEFT 0 false', output)
+        self.assertNotIn('RESULT ', output)
+
     def test_limits_are_fixed_in_the_service(self):
         source = (REPO / 'Service.qml').read_text()
         self.assertIn('readonly property int apiTimeoutMs: 30000', source)
         self.assertIn('readonly property int apiMaxResponseBytes: 16 * 1024 * 1024', source)
+        self.assertIn('readonly property int apiMaxInFlightBytes: 32 * 1024 * 1024', source)
         self.assertIn('xhr.responseType = "arraybuffer"', source)
+        # Sign-out and teardown must both abort whatever is still in flight.
+        for block in (r'^  function clearSession\(\) \{[\s\S]*?^  }$',
+                      r'^  Component\.onDestruction: \{[\s\S]*?^  }$'):
+            match = re.search(block, source, re.M)
+            self.assertIsNotNone(match, block)
+            self.assertIn('cancelRequests()', match.group(0))
 
 
 if __name__ == '__main__':

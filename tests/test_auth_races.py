@@ -133,7 +133,8 @@ Xhr.prototype.abort = function () {};
 const context = vm.createContext({
   serverUri: 'http://fixture.invalid:32400', serverToken: 'SYNTHETIC',
   serverName: 'fixture', clientId: 'audit', _sessionGeneration: 0,
-  apiTimeoutMs: 30000, apiMaxResponseBytes: 1024, _pendingRequests: [],
+  apiTimeoutMs: 30000, apiMaxResponseBytes: 1024, apiMaxInFlightBytes: 2048,
+  _pendingRequests: [],
   requestDeadline: {start() {}, stop() {}}, Qt: {callLater(fn) { fn(); }},
   XMLHttpRequest: Xhr, PlexApi: {url() { return 'http://fixture.invalid:32400/test'; }},
 });
