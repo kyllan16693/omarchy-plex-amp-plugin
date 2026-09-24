@@ -158,9 +158,13 @@ for value in rms:
 json.dump(out, sys.stdout, separators=(",", ":"))
 '
 )"
+# pipefail carries a failure anywhere in the pipeline here, including ffmpeg
+# being killed by its timeout. Python only sees EOF in that case and would
+# happily draw what arrived so far, so the status is what rules it out.
+status=$?
 rm -f "$media"
 
-if [ -z "$peaks" ]; then
+if [ "$status" -ne 0 ] || [ -z "$peaks" ]; then
   printf '%s\n' "$(jq -nc --arg k "$rating_key" '{stage:"error",ratingKey:$k,message:"could not analyse track"}')"
   exit 1
 fi

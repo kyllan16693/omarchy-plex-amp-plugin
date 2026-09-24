@@ -182,8 +182,10 @@ class WaveformBoundsTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.state = Path(self.temp.name) / 'omarchy/plexamp/waveform'
 
-    def run_waveform(self, path, **limits):
+    def run_waveform(self, path, bin_dir=None, **limits):
         env = dict(os.environ, XDG_STATE_HOME=self.temp.name)
+        if bin_dir:
+            env['PATH'] = str(bin_dir) + os.pathsep + env['PATH']
         env.update({key: str(value) for key, value in limits.items()})
         result = subprocess.run([str(REPO / 'bin/plexamp-waveform'), '42'], env=env,
                                 input=self.base + path + '?X-Plex-Token=' + SERVER_TOKEN + '\n',
@@ -216,6 +218,31 @@ class WaveformBoundsTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertEqual(message['stage'], 'error')
         self.assertFalse((self.state / '42.json').exists())
+
+    def test_decoder_failure_after_partial_output_is_refused(self):
+        # ffmpeg killed by its timeout mid-track: Python sees a clean EOF with
+        # plenty of samples, so only the pipeline status can reject the result.
+        # Ten seconds of PCM, then either the exit status timeout(1) reports or
+        # the SIGTERM it sends.
+        for name, ending in (('exit 124', 'sys.exit(124)'),
+                             ('SIGTERM', 'os.kill(os.getpid(), signal.SIGTERM)')):
+            with self.subTest(ending=name):
+                bin_dir = Path(self.temp.name) / ('bin-' + name.replace(' ', '-'))
+                bin_dir.mkdir()
+                fake = bin_dir / 'ffmpeg'
+                fake.write_text(f'#!{sys.executable}\n' + textwrap.dedent(f'''
+                    import math, os, signal, struct, sys
+                    pcm = b''.join(struct.pack('<h', int(8000 * math.sin(i / 5)))
+                                   for i in range(40000))
+                    sys.stdout.buffer.write(pcm)
+                    sys.stdout.flush()
+                    {ending}
+                '''))
+                fake.chmod(0o755)
+                result, message = self.run_waveform('/track', bin_dir=bin_dir)
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertEqual(message['stage'], 'error')
+                self.assertFalse((self.state / '42.json').exists())
 
     def test_limits_cannot_be_raised_from_the_environment(self):
         source = (REPO / 'bin/plexamp-waveform').read_text()
