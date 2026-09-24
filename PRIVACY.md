@@ -20,7 +20,9 @@ rating keys, and waveform caches live in `~/.local/state/omarchy/plexamp/`,
 a mode-`0700` directory. Full stream and artwork URLs are not written to
 state. A stream URL can contain a Plex token; it is retained only in the live
 player, passed to waveform analysis through a mode-`0600` temporary curl
-config, and removed as soon as that request ends. Artwork is fetched by the
+config, and removed as soon as that request ends. The audio fetched for
+analysis is held in a mode-`0600` temporary file in the same directory and
+deleted once the waveform is built. Artwork is fetched by the
 shell's own image loader with the token in the URL, as Plex requires; if such
 a fetch fails, Quickshell may record the URL in its per-user log under
 `$XDG_RUNTIME_DIR`. The mpv IPC socket lives under the same private

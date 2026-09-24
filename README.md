@@ -260,6 +260,11 @@ has already started, and every result is cached by rating key under
 `~/.local/state/omarchy/plexamp/waveform/` and again in memory, so a track is
 analysed once and never again. Tracks it can't read fall back to a plain progress line.
 
+Everything the server sends is bounded: the download is capped at 512 MiB and
+90 seconds, decoding at 90 seconds, and the decoded audio is folded into small
+blocks as it streams past, so memory stays flat however long the track is.
+Anything over three hours, or over either cap, is refused rather than drawn.
+
 ## Layout
 
 | File | Role |

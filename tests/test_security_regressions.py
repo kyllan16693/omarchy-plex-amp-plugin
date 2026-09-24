@@ -1,5 +1,6 @@
 """Credential-transport regressions; synthetic fixtures, no network or user state."""
 import json
+import http.server
 import os
 from pathlib import Path
 import shutil
@@ -7,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import unittest
 
 REPO = Path(__file__).resolve().parents[1]
@@ -129,6 +131,99 @@ class CredentialTransportTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(self.auth.exists())
         self.assertEqual(json.loads(result.stdout)['stage'], 'logged-out')
+
+
+class _MediaHandler(http.server.BaseHTTPRequestHandler):
+    """Serves one synthetic track, with or without a Content-Length."""
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        data = self.server.media
+        self.send_response(200)
+        if self.path.startswith('/chunked'):
+            self.send_header('Transfer-Encoding', 'chunked')
+            self.end_headers()
+            for i in range(0, len(data), 65536):
+                chunk = data[i:i + 65536]
+                self.wfile.write(b'%x\r\n' % len(chunk) + chunk + b'\r\n')
+            self.wfile.write(b'0\r\n\r\n')
+        else:
+            self.send_header('Content-Length', str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+
+@unittest.skipUnless(shutil.which('ffmpeg') and shutil.which('curl'), 'needs ffmpeg and curl')
+class WaveformBoundsTests(unittest.TestCase):
+    """A server can make the waveform helper fail, never grow without bound."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), _MediaHandler)
+        # The helper hanging up mid-transfer is the behaviour under test.
+        cls.server.handle_error = lambda *args: None
+        # Thirty seconds of noise: long enough for a real envelope, small
+        # enough that the caps below are far under its size and duration.
+        cls.server.media = subprocess.run(
+            ['ffmpeg', '-v', 'error', '-f', 'lavfi', '-i', 'anoisesrc=d=30:a=0.5',
+             '-ac', '1', '-c:a', 'flac', '-f', 'flac', '-'],
+            capture_output=True, check=True, timeout=60).stdout
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+        cls.base = 'http://127.0.0.1:%d' % cls.server.server_address[1]
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='ampbar-waveform-')
+        self.addCleanup(self.temp.cleanup)
+        self.state = Path(self.temp.name) / 'omarchy/plexamp/waveform'
+
+    def run_waveform(self, path, **limits):
+        env = dict(os.environ, XDG_STATE_HOME=self.temp.name)
+        env.update({key: str(value) for key, value in limits.items()})
+        result = subprocess.run([str(REPO / 'bin/plexamp-waveform'), '42'], env=env,
+                                input=self.base + path + '?X-Plex-Token=' + SERVER_TOKEN + '\n',
+                                capture_output=True, text=True, timeout=60)
+        self.assertNotIn(SERVER_TOKEN, result.stdout + result.stderr)
+        self.assertEqual([p.name for p in self.state.glob('.*')], [])
+        return result, json.loads(result.stdout)
+
+    def test_track_within_limits_is_analysed_and_cached(self):
+        for path in ('/track', '/chunked'):
+            with self.subTest(path=path):
+                for cached in self.state.glob('*.json'):
+                    cached.unlink()
+                result, message = self.run_waveform(path)
+                self.assertEqual(result.returncode, 0, result.stdout)
+                self.assertEqual(message['stage'], 'waveform')
+                self.assertEqual(len(message['peaks']), 120)
+                self.assertTrue((self.state / '42.json').exists())
+
+    def test_download_past_the_byte_cap_is_refused(self):
+        for path in ('/track', '/chunked'):
+            with self.subTest(path=path):
+                result, message = self.run_waveform(path, AMPBAR_WAVEFORM_MAX_BYTES=4096)
+                self.assertEqual(result.returncode, 1)
+                self.assertEqual(message['stage'], 'error')
+                self.assertFalse((self.state / '42.json').exists())
+
+    def test_audio_past_the_duration_cap_is_refused(self):
+        result, message = self.run_waveform('/track', AMPBAR_WAVEFORM_MAX_SECONDS=10)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(message['stage'], 'error')
+        self.assertFalse((self.state / '42.json').exists())
+
+    def test_limits_cannot_be_raised_from_the_environment(self):
+        source = (REPO / 'bin/plexamp-waveform').read_text()
+        self.assertIn('AMPBAR_WAVEFORM_MAX_BYTES < MAX_DOWNLOAD_BYTES', source)
+        self.assertIn('AMPBAR_WAVEFORM_MAX_SECONDS < MAX_SECONDS', source)
+        # No stage may read the whole response or the decoded audio at once.
+        self.assertNotIn('stdin.buffer.read()', source)
+        self.assertNotRegex(source, r'curl[^\n]*\|')
 
 
 if __name__ == '__main__':
