@@ -2,6 +2,7 @@
 import json
 import http.server
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -9,6 +10,7 @@ import sys
 import tempfile
 import textwrap
 import threading
+import time
 import unittest
 
 REPO = Path(__file__).resolve().parents[1]
@@ -251,6 +253,148 @@ class WaveformBoundsTests(unittest.TestCase):
         # No stage may read the whole response or the decoded audio at once.
         self.assertNotIn('stdin.buffer.read()', source)
         self.assertNotRegex(source, r'curl[^\n]*\|')
+
+
+class _PlexApiHandler(http.server.BaseHTTPRequestHandler):
+    """A Plex server that misbehaves in each of the ways the shell must survive."""
+    protocol_version = 'HTTP/1.1'
+
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        path = self.path.split('?')[0]
+        try:
+            if path == '/ok':
+                body = json.dumps({'MediaContainer': {'size': 1}}).encode()
+                self.send_response(200)
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            elif path == '/declared':
+                # Claims 100 MiB up front, then waits for the client to hang up.
+                self.send_response(200)
+                self.send_header('Content-Length', str(100 * 1024 * 1024))
+                self.end_headers()
+                self.wfile.write(b'{')
+                self.wfile.flush()
+                time.sleep(15)
+            elif path == '/endless':
+                # Chunked, so no length is ever declared; stops when refused.
+                self.send_response(200)
+                self.send_header('Transfer-Encoding', 'chunked')
+                self.end_headers()
+                chunk = b' ' * 65536
+                for _ in range(4096):
+                    self.wfile.write(b'%x\r\n' % len(chunk) + chunk + b'\r\n')
+                    self.wfile.flush()
+                    time.sleep(0.001)
+            elif path == '/trickle':
+                # One byte a fifth of a second: never idle, never finishing.
+                self.send_response(200)
+                self.send_header('Transfer-Encoding', 'chunked')
+                self.end_headers()
+                for _ in range(150):
+                    self.wfile.write(b'1\r\n \r\n')
+                    self.wfile.flush()
+                    time.sleep(0.2)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+
+@unittest.skipUnless(shutil.which('qml6') or shutil.which('qml'), 'needs the qml runtime')
+class PlexApiBoundsTests(unittest.TestCase):
+    """Service.qml's real request code, run under Qt against a hostile server."""
+    TIMEOUT_MS = 2000
+    MAX_BYTES = 1024 * 1024
+
+    @classmethod
+    def setUpClass(cls):
+        cls.server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), _PlexApiHandler)
+        cls.server.daemon_threads = True
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+        cls.base = 'http://127.0.0.1:%d' % cls.server.server_address[1]
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+
+    def harness(self, directory, paths):
+        source = (REPO / 'Service.qml').read_text()
+        pieces = []
+        for pattern in (r'^  function apiRequest\([^]*?^  }$',
+                        r'^  function expireRequests\([^]*?^  }$',
+                        r'^  function cancelRequests\([^]*?^  }$',
+                        r'^  Timer \{\n    id: requestDeadline[^]*?^  }$'):
+            match = re.search(pattern.replace('[^]', r'[\s\S]'), source, re.M)
+            self.assertIsNotNone(match, pattern)
+            pieces.append(match.group(0))
+        shutil.copy(REPO / 'PlexApi.js', directory / 'PlexApi.js')
+        (directory / 'harness.qml').write_text(textwrap.dedent('''\
+            import QtQuick
+            import "PlexApi.js" as PlexApi
+            Item {
+              id: root
+              property string serverUri: %(base)s
+              property string serverToken: "SYNTHETIC"
+              property string serverName: "fixture"
+              property string clientId: "audit"
+              property int _sessionGeneration: 0
+              readonly property int apiTimeoutMs: %(timeout)d
+              readonly property int apiMaxResponseBytes: %(cap)d
+              property var _pendingRequests: []
+              property int outstanding: %(count)d
+              function report(path, started, outcome) {
+                console.log("RESULT " + JSON.stringify({ path: path, ms: Date.now() - started,
+                                                         outcome: outcome }))
+                if (--outstanding === 0) Qt.quit()
+              }
+              Component.onCompleted: {
+                var paths = %(paths)s
+                paths.forEach(function (path) {
+                  var started = Date.now()
+                  root.apiRequest("GET", path, {},
+                    function (json) { root.report(path, started, "ok " + JSON.stringify(json)) },
+                    function (error) { root.report(path, started, "failed " + error) })
+                })
+              }
+            ''') % {'base': json.dumps(self.base), 'timeout': self.TIMEOUT_MS,
+                    'cap': self.MAX_BYTES, 'count': len(paths), 'paths': json.dumps(paths)}
+            + '\n\n'.join(pieces) + '\n}\n')
+        return directory / 'harness.qml'
+
+    def run_requests(self, *paths):
+        with tempfile.TemporaryDirectory(prefix='ampbar-api-') as temp:
+            qml = self.harness(Path(temp), list(paths))
+            env = dict(os.environ, QT_QPA_PLATFORM='offscreen', QT_FORCE_STDERR_LOGGING='1')
+            result = subprocess.run([shutil.which('qml6') or shutil.which('qml'), str(qml)],
+                                    env=env, capture_output=True, text=True, timeout=30)
+        output = result.stdout + result.stderr
+        results = {}
+        for line in output.splitlines():
+            if 'RESULT ' in line:
+                entry = json.loads(line.split('RESULT ', 1)[1])
+                results[entry['path']] = entry
+        self.assertEqual(sorted(results), sorted(paths), output)
+        return results
+
+    def test_bounded_replies_are_parsed_and_hostile_ones_refused(self):
+        results = self.run_requests('/ok', '/declared', '/endless', '/trickle')
+        self.assertEqual(results['/ok']['outcome'], 'ok {"MediaContainer":{"size":1}}')
+        self.assertEqual(results['/declared']['outcome'], 'failed response from Plex was too large')
+        self.assertEqual(results['/endless']['outcome'], 'failed response from Plex was too large')
+        self.assertEqual(results['/trickle']['outcome'], 'failed Plex took too long to respond')
+        # The deadline is total, not idle: a steady trickle still gets cut off.
+        self.assertLess(results['/trickle']['ms'], self.TIMEOUT_MS + 1500)
+        for path in ('/declared', '/endless'):
+            self.assertLess(results[path]['ms'], self.TIMEOUT_MS)
+
+    def test_limits_are_fixed_in_the_service(self):
+        source = (REPO / 'Service.qml').read_text()
+        self.assertIn('readonly property int apiTimeoutMs: 30000', source)
+        self.assertIn('readonly property int apiMaxResponseBytes: 16 * 1024 * 1024', source)
+        self.assertIn('xhr.responseType = "arraybuffer"', source)
 
 
 if __name__ == '__main__':

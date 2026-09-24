@@ -250,6 +250,13 @@ Omarchy's `shell.json`. Disabling or removing the plugin shuts down mpv. A
 temporarily unreadable shell configuration gets five seconds to recover before
 the player stops.
 
+## Plex requests
+
+Library, search, and play-queue requests run inside the shell, so each one is
+bounded too: a reply must arrive within 30 seconds in total and stay under
+16 MiB (about 12,000 tracks' worth), or the request is aborted and reported as
+an error rather than parsed. Signing out cancels anything still in flight.
+
 ## The waveform
 
 Your server exposes no loudness ramps (that needs Plex's own sonic analysis), so

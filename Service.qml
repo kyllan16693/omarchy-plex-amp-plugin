@@ -222,6 +222,7 @@ Item {
 
   function clearSession() {
     _sessionGeneration++
+    cancelRequests()
     stop()
     shutdownEngine()
     waveQueue = []
@@ -393,6 +394,15 @@ Item {
 
   // =============================================================== Plex HTTP
 
+  // Plex replies are buffered and parsed inside the shell process, so each
+  // request is bounded in time and size. A server that stalls, trickles, or
+  // streams without end is cut off instead of holding a socket open or
+  // growing the shell's memory. Plex spends about 1.4 KB per track, so the
+  // cap still fits an artist's /allLeaves of some 12,000 tracks.
+  readonly property int apiTimeoutMs: 30000
+  readonly property int apiMaxResponseBytes: 16 * 1024 * 1024
+  property var _pendingRequests: []
+
   function apiRequest(method, path, params, onSuccess, onFailure) {
     if (!serverUri || !serverToken) {
       if (onFailure) onFailure("not connected")
@@ -404,9 +414,46 @@ Item {
 
     var xhr = new XMLHttpRequest()
     var generation = _sessionGeneration
+    var pending = { xhr: xhr, deadline: Date.now() + apiTimeoutMs, error: "" }
+    // Qt keeps using the network reply after a readystatechange handler
+    // returns, so aborting from inside one crashes the shell. The abort waits
+    // for the handler to unwind; the reason is recorded now, and DONE (from
+    // abort() or a reply that finishes first) reports it.
+    function cancel(error) {
+      if (pending.error) return
+      pending.error = error
+      Qt.callLater(function () { xhr.abort() })
+    }
+    pending.cancel = cancel
+    function tooLarge() {
+      // An arraybuffer response exposes the bytes received so far without
+      // copying or decoding them, which makes this check cheap per chunk.
+      var body = xhr.response
+      return !!body && body.byteLength > root.apiMaxResponseBytes
+    }
     xhr.onreadystatechange = function () {
+      if (xhr.readyState === XMLHttpRequest.HEADERS_RECEIVED) {
+        var declared = Number(xhr.getResponseHeader("Content-Length"))
+        if (declared > root.apiMaxResponseBytes) cancel("response from Plex was too large")
+        return
+      }
+      if (xhr.readyState === XMLHttpRequest.LOADING) {
+        if (tooLarge()) cancel("response from Plex was too large")
+        return
+      }
       if (xhr.readyState !== XMLHttpRequest.DONE) return
+      var at = root._pendingRequests.indexOf(pending)
+      if (at >= 0) root._pendingRequests.splice(at, 1)
       if (generation !== root._sessionGeneration) return
+      if (pending.error) {
+        if (onFailure) onFailure(pending.error)
+        return
+      }
+      // The final chunk can arrive together with DONE.
+      if (tooLarge()) {
+        if (onFailure) onFailure("response from Plex was too large")
+        return
+      }
       if (xhr.status >= 200 && xhr.status < 300) {
         var parsed = null
         try {
@@ -421,10 +468,35 @@ Item {
                                    : "Plex returned HTTP " + xhr.status)
       }
     }
+    xhr.responseType = "arraybuffer"
     xhr.open(method, target)
     xhr.setRequestHeader("Accept", "application/json")
     if (clientId) xhr.setRequestHeader("X-Plex-Client-Identifier", clientId)
+    _pendingRequests.push(pending)
+    requestDeadline.start()
     xhr.send()
+  }
+
+  // One shared clock enforces the total deadline, however slowly the bytes
+  // arrive; per-chunk activity never extends it.
+  function expireRequests(now) {
+    var expired = _pendingRequests.filter(function (p) { return now >= p.deadline })
+    for (var i = 0; i < expired.length; i++)
+      expired[i].cancel("Plex took too long to respond")
+    if (!_pendingRequests.length) requestDeadline.stop()
+  }
+
+  function cancelRequests() {
+    var all = _pendingRequests.slice()
+    for (var i = 0; i < all.length; i++) all[i].cancel("cancelled")
+  }
+
+  Timer {
+    id: requestDeadline
+    interval: 1000
+    repeat: true
+    running: false
+    onTriggered: root.expireRequests(Date.now())
   }
 
   function request(path, params, onSuccess, onFailure) {

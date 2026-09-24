@@ -122,14 +122,19 @@ const qml = fs.readFileSync(process.argv[1], 'utf8');
 const match = qml.match(/^  function apiRequest\([^]*?^  }/m);
 assert.ok(match, 'missing QML function apiRequest');
 const requests = [];
-function Xhr() { requests.push(this); this.readyState = 0; this.status = 0; }
+function Xhr() { requests.push(this); this.readyState = 0; this.status = 0; this.response = null; }
+Xhr.HEADERS_RECEIVED = 2;
+Xhr.LOADING = 3;
 Xhr.DONE = 4;
 Xhr.prototype.open = function () {};
 Xhr.prototype.setRequestHeader = function () {};
 Xhr.prototype.send = function () {};
+Xhr.prototype.abort = function () {};
 const context = vm.createContext({
   serverUri: 'http://fixture.invalid:32400', serverToken: 'SYNTHETIC',
   serverName: 'fixture', clientId: 'audit', _sessionGeneration: 0,
+  apiTimeoutMs: 30000, apiMaxResponseBytes: 1024, _pendingRequests: [],
+  requestDeadline: {start() {}, stop() {}}, Qt: {callLater(fn) { fn(); }},
   XMLHttpRequest: Xhr, PlexApi: {url() { return 'http://fixture.invalid:32400/test'; }},
 });
 context.root = context;
