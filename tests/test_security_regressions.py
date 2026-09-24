@@ -51,7 +51,9 @@ class CredentialTransportTests(unittest.TestCase):
             with open(os.environ['AMPBAR_TEST_LOG'], 'a') as output:
                 output.write(json.dumps({'tool': 'curl', 'argv': sys.argv[1:],
                                          'stdin': config, 'env': dict(os.environ)}) + '\\n')
-            if '/resources?' in sys.argv[-1]:
+            if sys.argv[-1].endswith('/api/v2/pins') and os.environ.get('AMPBAR_TEST_PIN'):
+                print(os.environ['AMPBAR_TEST_PIN'])
+            elif '/resources?' in sys.argv[-1]:
                 print(json.dumps([{'name': 'Synthetic library', 'provides': 'server',
                     'accessToken': 'SYNTHETIC_SERVER_TOKEN', 'owned': True,
                     'connections': [{'uri': 'https://plex.example.invalid:32400',
@@ -59,6 +61,9 @@ class CredentialTransportTests(unittest.TestCase):
             else:
                 print(json.dumps({'MediaContainer': {'machineIdentifier': 'fake-machine'}}))
         ''')
+
+        # Sign-in would otherwise open a browser on the desktop running the tests.
+        self.make_helper('xdg-open', 'pass')
 
     def make_helper(self, name, source):
         target = self.bin / name
@@ -82,6 +87,7 @@ class CredentialTransportTests(unittest.TestCase):
                 self.assertNotIn(token, json.dumps(call.get('env', {})))
             if call['tool'] == 'curl':
                 self.assertEqual(call['argv'][0], '-q')
+                self.assertIn('--max-filesize', call['argv'])
                 self.assertIn('--config', call['argv'])
                 self.assertNotIn('-L', call['argv'])
                 self.assertNotIn('--location', call['argv'])
@@ -127,6 +133,22 @@ class CredentialTransportTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual([call for call in self.calls() if call['tool'] == 'curl'], [])
         self.assertEqual(json.loads(self.auth.read_text()), data)
+
+    def test_hostile_sign_in_code_is_refused_before_use(self):
+        # expiresIn reaches shell arithmetic, which runs command substitutions
+        # in the subscript of any variable that is set, such as HOME.
+        marker = self.root / 'executed'
+        for pin in ({'id': 1, 'code': 'ABCD', 'expiresIn': f'HOME[$(touch {marker})]'},
+                    {'id': '1/../../x', 'code': 'ABCD', 'expiresIn': 900},
+                    {'id': 1, 'code': 'AB&next=https://evil.invalid', 'expiresIn': 900}):
+            with self.subTest(pin=pin):
+                env = dict(self.env, AMPBAR_TEST_PIN=json.dumps(pin))
+                result = subprocess.run([str(REPO / 'bin/plexamp-auth'), 'login'], env=env,
+                                        capture_output=True, text=True, timeout=10)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('unexpected sign-in code', result.stdout)
+                self.assertNotIn('"stage":"pin"', result.stdout)
+                self.assertFalse(marker.exists(), 'plex.tv data was executed')
 
     def test_logout_removes_credentials(self):
         result = self.run_auth('logout')
@@ -246,10 +268,23 @@ class WaveformBoundsTests(unittest.TestCase):
                 self.assertEqual(message['stage'], 'error')
                 self.assertFalse((self.state / '42.json').exists())
 
+    def test_cache_keeps_only_the_most_recent_tracks(self):
+        self.state.mkdir(parents=True)
+        for key, age in (('7', 500), ('8', 400), ('9', 300), ('10', 200)):
+            stale = self.state / f'{key}.json'
+            stale.write_text('{"peaks":[0.5]}\n')
+            os.utime(stale, (time.time() - age, time.time() - age))
+        result, message = self.run_waveform('/track', AMPBAR_WAVEFORM_MAX_CACHED=3)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(message['stage'], 'waveform')
+        self.assertEqual(sorted(p.name for p in self.state.glob('*.json')),
+                         ['10.json', '42.json', '9.json'])
+
     def test_limits_cannot_be_raised_from_the_environment(self):
         source = (REPO / 'bin/plexamp-waveform').read_text()
         self.assertIn('AMPBAR_WAVEFORM_MAX_BYTES < MAX_DOWNLOAD_BYTES', source)
         self.assertIn('AMPBAR_WAVEFORM_MAX_SECONDS < MAX_SECONDS', source)
+        self.assertIn('AMPBAR_WAVEFORM_MAX_CACHED < MAX_CACHED_TRACKS', source)
         # No stage may read the whole response or the decoded audio at once.
         self.assertNotIn('stdin.buffer.read()', source)
         self.assertNotRegex(source, r'curl[^\n]*\|')
@@ -268,6 +303,13 @@ class _PlexApiHandler(http.server.BaseHTTPRequestHandler):
             if path == '/ok':
                 body = json.dumps({'MediaContainer': {'size': 1}}).encode()
                 self.send_response(200)
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            elif path == '/cover.jpg':
+                body = self.server.cover
+                self.send_response(200)
+                self.send_header('Content-Type', 'image/jpeg')
                 self.send_header('Content-Length', str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
@@ -311,7 +353,8 @@ class _PlexApiHandler(http.server.BaseHTTPRequestHandler):
             pass
 
 
-@unittest.skipUnless(shutil.which('qml6') or shutil.which('qml'), 'needs the qml runtime')
+@unittest.skipUnless((shutil.which('qml6') or shutil.which('qml')) and shutil.which('ffmpeg'),
+                     'needs the qml runtime and ffmpeg')
 class PlexApiBoundsTests(unittest.TestCase):
     """Service.qml's real request code, run under Qt against a hostile server."""
     TIMEOUT_MS = 2000
@@ -322,6 +365,11 @@ class PlexApiBoundsTests(unittest.TestCase):
     def setUpClass(cls):
         cls.server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), _PlexApiHandler)
         cls.server.daemon_threads = True
+        # A real 64x64 JPEG, so the test proves Image can decode what arrives.
+        cls.server.cover = subprocess.run(
+            ['ffmpeg', '-v', 'error', '-f', 'lavfi', '-i', 'color=c=0xC81E5A:s=64x64',
+             '-frames:v', '1', '-f', 'mjpeg', '-'],
+            capture_output=True, check=True, timeout=30).stdout
         threading.Thread(target=cls.server.serve_forever, daemon=True).start()
         cls.base = 'http://127.0.0.1:%d' % cls.server.server_address[1]
 
@@ -334,6 +382,11 @@ class PlexApiBoundsTests(unittest.TestCase):
         source = (REPO / 'Service.qml').read_text()
         pieces = []
         for pattern in (r'^  function apiRequest\([^]*?^  }$',
+                        r'^  function fetchBounded\([^]*?^  }$',
+                        r'^  function artwork\([^]*?^  }$',
+                        r'^  function loadArtwork\([^]*?^  }$',
+                        r'^  function clearArtwork\([^]*?^  }$',
+                        r'^  function base64\([^]*?^  }$',
                         r'^  function expireRequests\([^]*?^  }$',
                         r'^  function cancelRequests\([^]*?^  }$',
                         r'^  Timer \{\n    id: requestDeadline[^]*?^  }$'):
@@ -354,6 +407,13 @@ class PlexApiBoundsTests(unittest.TestCase):
               readonly property int apiTimeoutMs: %(timeout)d
               readonly property int apiMaxResponseBytes: %(cap)d
               readonly property int apiMaxInFlightBytes: %(budget)d
+              readonly property int artMaxBytes: %(cap)d
+              readonly property int artCacheChars: 8 * 1024 * 1024
+              readonly property int artRetryMs: 300000
+              property int artRevision: 0
+              property var _art: ({})
+              property var _artOrder: []
+              property int _artChars: 0
               property var _pendingRequests: []
               property int outstanding: %(count)d
               // A label is a path plus an optional "#n", so one path can be
@@ -439,12 +499,72 @@ class PlexApiBoundsTests(unittest.TestCase):
         self.assertIn('LEFT 0 false', output)
         self.assertNotIn('RESULT ', output)
 
+    def test_artwork_is_bounded_and_reaches_image(self):
+        base = self.base
+        output = self.run_qml([], extra=textwrap.dedent('''\
+              property var covers: ({ good: %(good)s, endless: %(endless)s,
+                                      trickle: %(trickle)s, foreign: "http://127.0.0.2:9/x.jpg" })
+              Image {
+                id: shown
+                source: root.artwork(root.covers.good)
+                sourceSize.width: 48
+              }
+              Timer {
+                interval: 100
+                running: true
+                onTriggered: {
+                  for (var k in root.covers) root.artwork(root.covers[k])
+                  // RFC 4648 vectors, plus every byte value.
+                  var all = []
+                  for (var b = 0; b < 256; b++) all.push(b)
+                  var enc = function (text) {
+                    var bytes = []
+                    for (var i = 0; i < text.length; i++) bytes.push(text.charCodeAt(i))
+                    return root.base64(bytes)
+                  }
+                  console.log("B64 " + JSON.stringify([enc(""), enc("f"), enc("fo"), enc("foo"),
+                                                       enc("foob"), enc("fooba"), enc("foobar"),
+                                                       root.base64(all)]))
+                }
+              }
+              Timer {
+                interval: %(wait)d
+                running: true
+                onTriggered: {
+                  var out = {}
+                  for (var k in root.covers) out[k] = root.artwork(root.covers[k]).slice(0, 23)
+                  out.image = shown.status === Image.Ready ? shown.implicitWidth : -1
+                  out.pending = root._pendingRequests.length
+                  console.log("ART " + JSON.stringify(out))
+                  Qt.quit()
+                }
+              }''') % {'good': json.dumps(base + '/cover.jpg'), 'endless': json.dumps(base + '/endless'),
+                          'trickle': json.dumps(base + '/trickle'), 'wait': self.TIMEOUT_MS + 1500})
+        art = json.loads(output.split('ART ', 1)[1].splitlines()[0])
+        self.assertEqual(art, {'good': 'data:image/jpeg;base64,', 'endless': '', 'trickle': '',
+                               'foreign': '', 'image': 48, 'pending': 0}, output)
+        import base64
+        encoded = json.loads(output.split('B64 ', 1)[1].splitlines()[0])
+        expected = [base64.b64encode(v).decode() for v in
+                    (b'', b'f', b'fo', b'foo', b'foob', b'fooba', b'foobar', bytes(range(256)))]
+        self.assertEqual(encoded, expected)
+
+    def test_panel_never_hands_image_a_remote_url(self):
+        # Every cover in the panel must come through Service.artwork(), which
+        # is bounded; a bare network URL would go to Qt's unbounded loader.
+        panel = (REPO / 'Panel.qml').read_text()
+        sources = re.findall(r'^\s*source:.*$', panel, re.M)
+        self.assertTrue(sources)
+        for line in sources:
+            self.assertIn('artwork(', line)
+
     def test_limits_are_fixed_in_the_service(self):
         source = (REPO / 'Service.qml').read_text()
         self.assertIn('readonly property int apiTimeoutMs: 30000', source)
         self.assertIn('readonly property int apiMaxResponseBytes: 16 * 1024 * 1024', source)
         self.assertIn('readonly property int apiMaxInFlightBytes: 32 * 1024 * 1024', source)
         self.assertIn('xhr.responseType = "arraybuffer"', source)
+        self.assertIn('readonly property int artMaxBytes: 2 * 1024 * 1024', source)
         # Sign-out and teardown must both abort whatever is still in flight.
         for block in (r'^  function clearSession\(\) \{[\s\S]*?^  }$',
                       r'^  Component\.onDestruction: \{[\s\S]*?^  }$'):

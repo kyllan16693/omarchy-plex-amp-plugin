@@ -256,7 +256,12 @@ Library, search, and play-queue requests run inside the shell, so each one is
 bounded too: a reply must arrive within 30 seconds in total and stay under
 16 MiB (about 12,000 tracks' worth), and everything in flight together must stay
 under 32 MiB, or the request is aborted and reported as an error rather than
-parsed. Signing out or unloading the plugin cancels anything still in flight.
+parsed. Cover art takes the same path, capped at 2 MiB per cover (Plex's
+largest transcodes are about 0.5 MB), and reaches the panel as in-memory image
+data, so the shell's image loader never fetches from the network. Signing out or
+unloading the plugin cancels anything still in flight. Sign-in replies from
+plex.tv are capped at 4 MiB, and the waveform cache keeps the 2,000 most
+recently played tracks.
 
 ## The waveform
 

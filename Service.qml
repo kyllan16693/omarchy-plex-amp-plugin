@@ -223,6 +223,9 @@ Item {
   function clearSession() {
     _sessionGeneration++
     cancelRequests()
+    clearArtwork()
+    _tintCache = ({})
+    _tintAlbumKey = ""
     stop()
     shutdownEngine()
     waveQueue = []
@@ -414,7 +417,21 @@ Item {
     var query = params || {}
     query["X-Plex-Token"] = serverToken
     var target = PlexApi.url(serverUri, path, query)
+    fetchBounded(method, target, "application/json", apiMaxResponseBytes, function (xhr) {
+      var parsed = null
+      try {
+        parsed = JSON.parse(xhr.responseText)
+      } catch (e) {
+        if (onFailure) onFailure("unreadable response from Plex")
+        return
+      }
+      if (onSuccess) onSuccess(parsed)
+    }, onFailure)
+  }
 
+  // Every request to the server goes through here: JSON and cover art alike.
+  // onSuccess receives the finished XMLHttpRequest for a 2xx reply.
+  function fetchBounded(method, target, accept, maxBytes, onSuccess, onFailure) {
     var xhr = new XMLHttpRequest()
     var generation = _sessionGeneration
     var pending = { xhr: xhr, deadline: Date.now() + apiTimeoutMs, bytes: 0, error: "" }
@@ -435,7 +452,7 @@ Item {
       // copying or decoding them, which makes this check cheap per chunk.
       var body = xhr.response
       pending.bytes = body ? body.byteLength : 0
-      if (pending.bytes > root.apiMaxResponseBytes) return true
+      if (pending.bytes > maxBytes) return true
       var total = 0
       for (var i = 0; i < root._pendingRequests.length; i++)
         total += root._pendingRequests[i].bytes
@@ -444,7 +461,7 @@ Item {
     xhr.onreadystatechange = function () {
       if (xhr.readyState === XMLHttpRequest.HEADERS_RECEIVED) {
         var declared = Number(xhr.getResponseHeader("Content-Length"))
-        if (declared > root.apiMaxResponseBytes) cancel("response from Plex was too large")
+        if (declared > maxBytes) cancel("response from Plex was too large")
         return
       }
       if (xhr.readyState === XMLHttpRequest.LOADING) {
@@ -462,19 +479,12 @@ Item {
       }
       // The final chunk can arrive together with DONE. This reply has left
       // the shared budget, so only its own cap applies now.
-      if (xhr.response && xhr.response.byteLength > root.apiMaxResponseBytes) {
+      if (xhr.response && xhr.response.byteLength > maxBytes) {
         if (onFailure) onFailure("response from Plex was too large")
         return
       }
       if (xhr.status >= 200 && xhr.status < 300) {
-        var parsed = null
-        try {
-          parsed = JSON.parse(xhr.responseText)
-        } catch (e) {
-          if (onFailure) onFailure("unreadable response from Plex")
-          return
-        }
-        if (onSuccess) onSuccess(parsed)
+        if (onSuccess) onSuccess(xhr)
       } else if (onFailure) {
         onFailure(xhr.status === 0 ? "could not reach " + root.serverName
                                    : "Plex returned HTTP " + xhr.status)
@@ -482,7 +492,7 @@ Item {
     }
     xhr.responseType = "arraybuffer"
     xhr.open(method, target)
-    xhr.setRequestHeader("Accept", "application/json")
+    xhr.setRequestHeader("Accept", accept)
     if (clientId) xhr.setRequestHeader("X-Plex-Client-Identifier", clientId)
     _pendingRequests.push(pending)
     requestDeadline.running = true
@@ -514,6 +524,80 @@ Item {
 
   function request(path, params, onSuccess, onFailure) {
     apiRequest("GET", path, params, onSuccess, onFailure)
+  }
+
+  // ================================================================ artwork
+
+  // Qt's image loader would buffer a reply of any size with no deadline, so
+  // cover art is fetched through fetchBounded as well and reaches Image as a
+  // data: URL. Plex's 600px transcodes stay under 600 KB (10-70 KB typical).
+  readonly property int artMaxBytes: 2 * 1024 * 1024
+  // Base64 characters kept across all cached covers; far more than a panel
+  // full of covers needs, but a server serving oversized ones still can't
+  // grow it.
+  readonly property int artCacheChars: 32 * 1024 * 1024
+  // A cover that failed or was evicted is not asked for again sooner, so an
+  // oversized cover can't be fetched in a loop.
+  readonly property int artRetryMs: 5 * 60 * 1000
+  // Bumped as covers arrive, so bindings that called artwork() look again.
+  property int artRevision: 0
+  property var _art: ({})     // url -> { data: data: URL or "", at: last fetch }
+  property var _artOrder: []  // cached urls, oldest first
+  property int _artChars: 0
+
+  // For Image.source bindings: the cover as a data: URL once it has arrived,
+  // "" until then or if it can't be had.
+  function artwork(url) {
+    var revision = artRevision
+    if (!url) return ""
+    var entry = _art[url]
+    if (entry && (entry.data || Date.now() - entry.at < artRetryMs)) return entry.data
+    loadArtwork(url)
+    return ""
+  }
+
+  function loadArtwork(url) {
+    var entry = { data: "", at: Date.now() }
+    _art[url] = entry
+    // Covers only ever come from the signed-in server.
+    if (!serverUri || String(url).indexOf(serverUri + "/") !== 0) return
+    fetchBounded("GET", url, "image/*", artMaxBytes, function (xhr) {
+      var type = String(xhr.getResponseHeader("Content-Type") || "").split(";")[0].trim().toLowerCase()
+      if (!/^image\/(jpeg|png|webp|gif)$/.test(type) || root._art[url] !== entry) return
+      entry.data = "data:" + type + ";base64," + root.base64(new Uint8Array(xhr.response))
+      root._artOrder.push(url)
+      root._artChars += entry.data.length
+      while (root._artChars > root.artCacheChars && root._artOrder.length > 1) {
+        var old = root._art[root._artOrder.shift()]
+        root._artChars -= old.data.length
+        old.data = ""
+        old.at = Date.now()
+      }
+      root.artRevision++
+    }, function () {})
+  }
+
+  function clearArtwork() {
+    _art = ({})
+    _artOrder = []
+    _artChars = 0
+    artRevision++
+  }
+
+  function base64(bytes) {
+    var table = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    var out = []
+    var i = 0
+    for (; i + 2 < bytes.length; i += 3) {
+      var v = (bytes[i] << 16) | (bytes[i + 1] << 8) | bytes[i + 2]
+      out.push(table[v >> 18] + table[(v >> 12) & 63] + table[(v >> 6) & 63] + table[v & 63])
+    }
+    if (i < bytes.length) {
+      var two = i + 1 < bytes.length
+      var r = (bytes[i] << 16) | ((two ? bytes[i + 1] : 0) << 8)
+      out.push(table[r >> 18] + table[(r >> 12) & 63] + (two ? table[(r >> 6) & 63] : "=") + "=")
+    }
+    return out.join("")
   }
 
   // ============================================================== libraries
@@ -1028,8 +1112,11 @@ Item {
     request("/library/metadata/" + albumKey, {}, function (response) {
       var items = PlexApi.metadataList(response)
       var colors = items.length ? PlexApi.ultraBlur(items[0]) : null
+      // Bounded like waveCache: radio can visit new albums indefinitely.
       var next = {}
-      for (var k in root._tintCache) next[k] = root._tintCache[k]
+      var keys = Object.keys(root._tintCache)
+      for (var i = Math.max(0, keys.length - 60); i < keys.length; i++)
+        next[keys[i]] = root._tintCache[keys[i]]
       next[albumKey] = colors
       root._tintCache = next
       if (root._tintAlbumKey === albumKey) root.tint = colors

@@ -532,7 +532,7 @@ Panel {
           Image {
             id: art
             anchors.fill: parent
-            source: barIcon.artSource
+            source: root.plex ? root.plex.artwork(barIcon.artSource) : ""
             asynchronous: true
             cache: true
             mipmap: true
@@ -895,7 +895,7 @@ Panel {
 
                 Image {
                   anchors.fill: parent
-                  source: rowItem.item ? (rowItem.item.art || "") : ""
+                  source: root.plex && rowItem.item ? root.plex.artwork(rowItem.item.art || "") : ""
                   asynchronous: true
                   cache: true
                   fillMode: Image.PreserveAspectCrop
@@ -1052,7 +1052,7 @@ Panel {
 
           Image {
             anchors.fill: parent
-            source: root.track ? (root.track.artLarge || root.track.art || "") : ""
+            source: root.plex && root.track ? root.plex.artwork(root.track.artLarge || root.track.art || "") : ""
             asynchronous: true
             cache: true
             fillMode: Image.PreserveAspectCrop
@@ -1250,7 +1250,7 @@ Panel {
 
                 Image {
                   anchors.fill: parent
-                  source: upNextRow.modelData ? (upNextRow.modelData.art || "") : ""
+                  source: root.plex && upNextRow.modelData ? root.plex.artwork(upNextRow.modelData.art || "") : ""
                   asynchronous: true
                   cache: true
                   fillMode: Image.PreserveAspectCrop
@@ -1463,7 +1463,7 @@ Panel {
 
           Image {
             anchors.fill: parent
-            source: root.track ? (root.track.artLarge || root.track.art || "") : ""
+            source: root.plex && root.track ? root.plex.artwork(root.track.artLarge || root.track.art || "") : ""
             asynchronous: true
             cache: true
             fillMode: Image.PreserveAspectCrop

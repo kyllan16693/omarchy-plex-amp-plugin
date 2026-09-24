@@ -63,6 +63,11 @@ plex_headers=(
   -H "X-Plex-Model: hosted"
 )
 
+# Every reply from plex.tv or the server is held in memory, so each is capped
+# in size as well as time. The largest, the account's resource list, is a few
+# KB per server.
+MAX_RESPONSE_BYTES=$((4 * 1024 * 1024))
+
 # A pipe keeps the token out of argv, the environment, and temporary files.
 # Refuse curl-config/header metacharacters before constructing the config.
 # Authenticated requests never follow redirects: curl forwards custom headers
@@ -72,7 +77,7 @@ authenticated_get() {
   [[ "$token" =~ ^[A-Za-z0-9._~-]+$ ]] || return 1
   valid_server_uri "$target" || return 1
   printf 'header = "X-Plex-Token: %s"\n' "$token" \
-    | curl -q --config - -sf --max-time "$seconds" \
+    | curl -q --config - -sf --max-time "$seconds" --max-filesize "$MAX_RESPONSE_BYTES" \
       --proto '=http,https' "${plex_headers[@]}" -- "$target"
 }
 
@@ -233,13 +238,17 @@ case "${1:-login}" in
   *) fail "unknown command: $1" ;;
 esac
 
-pin_response="$(curl -sfL --max-time 20 -X POST "${plex_headers[@]}" \
+pin_response="$(curl -sfL --max-time 20 --max-filesize "$MAX_RESPONSE_BYTES" -X POST "${plex_headers[@]}" \
   "https://plex.tv/api/v2/pins")" || fail "could not reach plex.tv to start sign-in"
 
 pin_id="$(printf '%s' "$pin_response" | jq -r '.id // empty')"
 pin_code="$(printf '%s' "$pin_response" | jq -r '.code // empty')"
 expires_in="$(printf '%s' "$pin_response" | jq -r '.expiresIn // 900')"
 [[ -n "$pin_id" && -n "$pin_code" ]] || fail "plex.tv did not return a sign-in code"
+# These reach a URL, the polling request, and shell arithmetic, which would
+# evaluate anything else as an expression. Anything unexpected fails closed.
+[[ "$pin_id" =~ ^[0-9]{1,20}$ && "$pin_code" =~ ^[A-Za-z0-9]{1,64}$ \
+   && "$expires_in" =~ ^[0-9]{1,5}$ ]] || fail "plex.tv returned an unexpected sign-in code"
 
 link_url="https://app.plex.tv/auth#?clientID=${CLIENT_ID}&code=${pin_code}"
 link_url+="&context%5Bdevice%5D%5Bproduct%5D=$(jq -rn --arg v "$PRODUCT" '$v|@uri')"
@@ -257,7 +266,7 @@ deadline=$(( $(date +%s) + expires_in ))
 auth_token=""
 while (( $(date +%s) < deadline )); do
   sleep 2
-  check="$(curl -sfL --max-time 10 "${plex_headers[@]}" \
+  check="$(curl -sfL --max-time 10 --max-filesize "$MAX_RESPONSE_BYTES" "${plex_headers[@]}" \
     "https://plex.tv/api/v2/pins/${pin_id}")" || continue
   auth_token="$(printf '%s' "$check" | jq -r '.authToken // empty')"
   [[ -n "$auth_token" ]] && break

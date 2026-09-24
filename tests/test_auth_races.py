@@ -119,8 +119,11 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const assert = require('node:assert/strict');
 const qml = fs.readFileSync(process.argv[1], 'utf8');
-const match = qml.match(/^  function apiRequest\([^]*?^  }/m);
-assert.ok(match, 'missing QML function apiRequest');
+const pieces = ['apiRequest', 'fetchBounded'].map(function (name) {
+  const found = qml.match(new RegExp('^  function ' + name + '\\([^]*?^  }', 'm'));
+  assert.ok(found, 'missing QML function ' + name);
+  return found[0];
+});
 const requests = [];
 function Xhr() { requests.push(this); this.readyState = 0; this.status = 0; this.response = null; }
 Xhr.HEADERS_RECEIVED = 2;
@@ -139,7 +142,7 @@ const context = vm.createContext({
   XMLHttpRequest: Xhr, PlexApi: {url() { return 'http://fixture.invalid:32400/test'; }},
 });
 context.root = context;
-vm.runInContext(match[0], context);
+vm.runInContext(pieces.join('\n'), context);
 let successes = 0, failures = 0;
 function finish(request) {
   request.readyState = Xhr.DONE;

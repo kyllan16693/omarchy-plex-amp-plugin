@@ -22,13 +22,17 @@ set -uo pipefail
 BUCKETS=120
 MAX_DOWNLOAD_BYTES=$((512 * 1024 * 1024))
 MAX_SECONDS=$((3 * 60 * 60))
-# Tests shrink the limits so they can be exercised quickly. Neither can be
+MAX_CACHED_TRACKS=2000
+# Tests shrink the limits so they can be exercised quickly. None can be
 # raised past the defaults above.
 if [[ "${AMPBAR_WAVEFORM_MAX_BYTES:-}" =~ ^[0-9]+$ ]] && (( AMPBAR_WAVEFORM_MAX_BYTES < MAX_DOWNLOAD_BYTES )); then
   MAX_DOWNLOAD_BYTES=$AMPBAR_WAVEFORM_MAX_BYTES
 fi
 if [[ "${AMPBAR_WAVEFORM_MAX_SECONDS:-}" =~ ^[0-9]+$ ]] && (( AMPBAR_WAVEFORM_MAX_SECONDS < MAX_SECONDS )); then
   MAX_SECONDS=$AMPBAR_WAVEFORM_MAX_SECONDS
+fi
+if [[ "${AMPBAR_WAVEFORM_MAX_CACHED:-}" =~ ^[0-9]+$ ]] && (( AMPBAR_WAVEFORM_MAX_CACHED > 0 && AMPBAR_WAVEFORM_MAX_CACHED < MAX_CACHED_TRACKS )); then
+  MAX_CACHED_TRACKS=$AMPBAR_WAVEFORM_MAX_CACHED
 fi
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/plexamp/waveform"
 
@@ -44,6 +48,8 @@ cache="$STATE_DIR/$rating_key.json"
 
 emit_cached() {
   if [ -s "$cache" ] && jq -e '.peaks | length > 0' "$cache" >/dev/null 2>&1; then
+    # Pruning below goes by age, so a track still being played stays.
+    touch "$cache" 2>/dev/null || true
     jq -c --arg k "$rating_key" '{stage:"waveform", ratingKey:$k, peaks:.peaks}' "$cache"
     return 0
   fi
@@ -172,5 +178,11 @@ fi
 tmp="$(mktemp "$STATE_DIR/.wave.XXXXXX")" || exit 1
 printf '{"peaks":%s}\n' "$peaks" > "$tmp"
 mv -f "$tmp" "$cache"
+
+# About 1 KB per track: keep the most recently played so the cache is bounded
+# however long radio runs. Names are numeric rating keys, checked above.
+find "$STATE_DIR" -maxdepth 1 -type f -name '[0-9]*.json' -printf '%T@ %f\n' \
+  | sort -rn | tail -n +$((MAX_CACHED_TRACKS + 1)) | cut -d' ' -f2 \
+  | while IFS= read -r stale; do rm -f -- "$STATE_DIR/$stale"; done
 
 printf '%s\n' "$(jq -nc --arg k "$rating_key" --argjson p "$peaks" '{stage:"waveform",ratingKey:$k,peaks:$p}')"
