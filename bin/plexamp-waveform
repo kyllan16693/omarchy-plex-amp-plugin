@@ -12,9 +12,24 @@
 # The URL carries an X-Plex-Token, which is why it comes in over stdin. It is
 # subsequently held in a mode-0600 curl config file rather than passed to
 # ffmpeg or curl as argv: argv is readable through /proc on many systems.
+#
+# Everything the server sends is bounded before it can grow: the download is
+# capped in bytes and time, ffmpeg in time, and the decoded audio is folded into
+# fixed-size blocks as it streams past and refused past a maximum duration. A
+# hostile or broken server can make this fail, not eat the desktop's memory.
 set -uo pipefail
 
 BUCKETS=120
+MAX_DOWNLOAD_BYTES=$((512 * 1024 * 1024))
+MAX_SECONDS=$((3 * 60 * 60))
+# Tests shrink the limits so they can be exercised quickly. Neither can be
+# raised past the defaults above.
+if [[ "${AMPBAR_WAVEFORM_MAX_BYTES:-}" =~ ^[0-9]+$ ]] && (( AMPBAR_WAVEFORM_MAX_BYTES < MAX_DOWNLOAD_BYTES )); then
+  MAX_DOWNLOAD_BYTES=$AMPBAR_WAVEFORM_MAX_BYTES
+fi
+if [[ "${AMPBAR_WAVEFORM_MAX_SECONDS:-}" =~ ^[0-9]+$ ]] && (( AMPBAR_WAVEFORM_MAX_SECONDS < MAX_SECONDS )); then
+  MAX_SECONDS=$AMPBAR_WAVEFORM_MAX_SECONDS
+fi
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/plexamp/waveform"
 
 rating_key="${1:-}"
@@ -57,27 +72,76 @@ mkdir -p "$STATE_DIR" || true
 chmod 700 "$STATE_DIR" 2>/dev/null || true
 
 request_config="$(mktemp "$STATE_DIR/.request.XXXXXX")" || exit 1
-trap 'rm -f "$request_config"' EXIT
+media="$(mktemp "$STATE_DIR/.media.XXXXXX")" || { rm -f "$request_config"; exit 1; }
+trap 'rm -f "$request_config" "$media"' EXIT
 printf 'url = "%s"\n' "$url" > "$request_config"
 
-peaks="$(
-  timeout 90 curl -fsSL --config "$request_config" 2>/dev/null \
-  | nice -n 19 ffmpeg -v error -nostdin -i pipe:0 -ac 1 -ar 4000 -f s16le - 2>/dev/null \
-  | BUCKETS="$BUCKETS" python3 -c '
-import sys, os, struct, math, json
+# Download to a private file rather than streaming into the decoder, so the
+# byte cap is enforced by curl before ffmpeg sees anything. --max-filesize
+# aborts mid-transfer too when the server sends no Content-Length; the size
+# check afterwards is the backstop for that.
+if ! curl -q -fsSL --proto '=http,https' --proto-redir '=http,https' --max-redirs 3 \
+    --connect-timeout 10 --max-time 90 --max-filesize "$MAX_DOWNLOAD_BYTES" \
+    --config "$request_config" --output "$media" 2>/dev/null \
+  || [ "$(stat -c %s "$media" 2>/dev/null || echo 0)" -gt "$MAX_DOWNLOAD_BYTES" ]; then
+  printf '%s\n' "$(jq -nc --arg k "$rating_key" '{stage:"error",ratingKey:$k,message:"could not fetch track"}')"
+  exit 1
+fi
 
-raw = sys.stdin.buffer.read()
-count = len(raw) // 2
+peaks="$(
+  timeout 90 nice -n 19 ffmpeg -v error -nostdin -i "$media" -ac 1 -ar 4000 -f s16le - 2>/dev/null \
+  | BUCKETS="$BUCKETS" MAX_SAMPLES="$((MAX_SECONDS * 4000))" python3 -c '
+import sys, os, math, json
+from array import array
+
+# Fold the PCM into per-block energy as it arrives instead of holding it all:
+# memory stays proportional to the duration cap, not to what the server sends.
+BLOCK = 100  # samples; 25 ms at 4 kHz
+max_samples = int(os.environ["MAX_SAMPLES"])
+buckets = int(os.environ.get("BUCKETS", "120"))
+
+energy = array("d")  # sum of squares per block
+sizes = array("l")   # samples per block; only the last can be short
+total = 0
+pending = b""
+stdin = sys.stdin.buffer
+
+def fold(data):
+    samples = array("h")
+    samples.frombytes(data)
+    if sys.byteorder != "little":
+        samples.byteswap()
+    for i in range(0, len(samples), BLOCK):
+        chunk = samples[i:i + BLOCK]
+        energy.append(float(sum(v * v for v in chunk)))
+        sizes.append(len(chunk))
+
+while True:
+    data = stdin.read(65536)
+    if not data:
+        break
+    total += len(data) // 2
+    if total > max_samples:
+        # Longer than any real track: refuse rather than draw a partial one.
+        sys.exit(1)
+    pending += data
+    usable = len(pending) - len(pending) % (BLOCK * 2)
+    if usable:
+        fold(pending[:usable])
+        pending = pending[usable:]
+if len(pending) >= 2:
+    fold(pending[:len(pending) - len(pending) % 2])
+
+count = sum(sizes)
 if count < 64:
     sys.exit(1)
 
-samples = struct.unpack("<%dh" % count, raw[:count * 2])
-buckets = int(os.environ.get("BUCKETS", "120"))
-
+blocks = len(energy)
 rms = []
 for i in range(buckets):
-    chunk = samples[i * count // buckets:(i + 1) * count // buckets] or (0,)
-    rms.append(math.sqrt(sum(v * v for v in chunk) / len(chunk)) / 32768.0)
+    lo = i * blocks // buckets
+    hi = max((i + 1) * blocks // buckets, lo + 1)
+    rms.append(math.sqrt(sum(energy[lo:hi]) / sum(sizes[lo:hi])) / 32768.0)
 
 # Stretch the envelope across the full height: modern masters sit in a narrow
 # loudness band, and the raw RMS would draw as a flat brick otherwise.
@@ -94,8 +158,13 @@ for value in rms:
 json.dump(out, sys.stdout, separators=(",", ":"))
 '
 )"
+# pipefail carries a failure anywhere in the pipeline here, including ffmpeg
+# being killed by its timeout. Python only sees EOF in that case and would
+# happily draw what arrived so far, so the status is what rules it out.
+status=$?
+rm -f "$media"
 
-if [ -z "$peaks" ]; then
+if [ "$status" -ne 0 ] || [ -z "$peaks" ]; then
   printf '%s\n' "$(jq -nc --arg k "$rating_key" '{stage:"error",ratingKey:$k,message:"could not analyse track"}')"
   exit 1
 fi
