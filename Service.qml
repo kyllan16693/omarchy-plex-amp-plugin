@@ -420,13 +420,43 @@ Item {
     fetchBounded(method, target, "application/json", apiMaxResponseBytes, function (xhr) {
       var parsed = null
       try {
-        parsed = JSON.parse(xhr.responseText)
+        parsed = root.clipStrings(JSON.parse(xhr.responseText))
       } catch (e) {
         if (onFailure) onFailure("unreadable response from Plex")
         return
       }
       if (onSuccess) onSuccess(parsed)
     }, onFailure)
+  }
+
+  // Titles and names end up in labels, and laying out one of several million
+  // characters stalls the shell for seconds. No real field comes close to
+  // this; keys and paths are far shorter. (Qt's JSON.parse ignores a reviver,
+  // so the parsed reply is walked instead.)
+  readonly property int apiMaxStringLength: 2000
+
+  function clipStrings(value) {
+    // Object.keys with indexed loops: four times faster than for-in here,
+    // about 55 ms for a 12,000-track reply against 100 ms to parse it.
+    var max = apiMaxStringLength
+    if (typeof value === "string") return value.length > max ? value.slice(0, max) : value
+    var stack = [value]
+    while (stack.length) {
+      var node = stack.pop()
+      if (node === null || typeof node !== "object") continue
+      var keys = Array.isArray(node) ? null : Object.keys(node)
+      var count = keys ? keys.length : node.length
+      for (var i = 0; i < count; i++) {
+        var key = keys ? keys[i] : i
+        var v = node[key]
+        if (typeof v === "string") {
+          if (v.length > max) node[key] = v.slice(0, max)
+        } else if (v !== null && typeof v === "object") {
+          stack.push(v)
+        }
+      }
+    }
+    return value
   }
 
   // Every request to the server goes through here: JSON and cover art alike.
@@ -572,9 +602,10 @@ Item {
     // Covers only ever come from the signed-in server.
     if (!serverUri || String(url).indexOf(serverUri + "/") !== 0) return
     fetchBounded("GET", url, "image/*", artMaxBytes, function (xhr) {
-      var type = String(xhr.getResponseHeader("Content-Type") || "").split(";")[0].trim().toLowerCase()
-      if (!/^image\/(jpeg|png|webp|gif)$/.test(type) || root._art[url] !== entry) return
-      entry.data = "data:" + type + ";base64," + root.base64(new Uint8Array(xhr.response))
+      var bytes = new Uint8Array(xhr.response)
+      var image = root.imageHeader(bytes)
+      if (!image || root._art[url] !== entry) return
+      entry.data = "data:" + image.type + ";base64," + root.base64(bytes)
       root._artOrder.push(url)
       root._artChars += entry.data.length
       while (root._artChars > root.artCacheChars && root._artOrder.length > 1) {
@@ -585,6 +616,41 @@ Item {
       }
       root.artRevision++
     }, function () {})
+  }
+
+  // Covers are decoded in the shell, and a small file can declare an enormous
+  // image: a 187 KB PNG decodes to 256 MB. The format is taken from the bytes,
+  // not the server's Content-Type, and only JPEG or PNG within artMaxPixels
+  // on each side is handed to Image. Plex's transcodes are 600px JPEGs.
+  readonly property int artMaxPixels: 2048
+
+  function imageHeader(bytes) {
+    var n = bytes.length
+    var w = 0, h = 0, type = ""
+    if (n > 24 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4E && bytes[3] === 0x47
+        && bytes[12] === 0x49 && bytes[13] === 0x48 && bytes[14] === 0x44 && bytes[15] === 0x52) {
+      type = "image/png"
+      w = ((bytes[16] << 24) | (bytes[17] << 16) | (bytes[18] << 8) | bytes[19]) >>> 0
+      h = ((bytes[20] << 24) | (bytes[21] << 16) | (bytes[22] << 8) | bytes[23]) >>> 0
+    } else if (n > 3 && bytes[0] === 0xFF && bytes[1] === 0xD8) {
+      // Walk the JPEG markers to the start-of-frame, which holds the size.
+      var i = 2
+      while (i + 9 < n && bytes[i] === 0xFF) {
+        var marker = bytes[i + 1]
+        if (marker === 0xFF) { i++; continue }
+        var length = (bytes[i + 2] << 8) | bytes[i + 3]
+        if (marker >= 0xC0 && marker <= 0xCF && marker !== 0xC4 && marker !== 0xC8 && marker !== 0xCC) {
+          h = (bytes[i + 5] << 8) | bytes[i + 6]
+          w = (bytes[i + 7] << 8) | bytes[i + 8]
+          type = "image/jpeg"
+          break
+        }
+        if (length < 2) return null
+        i += 2 + length
+      }
+    }
+    if (!type || w < 1 || h < 1 || w > artMaxPixels || h > artMaxPixels) return null
+    return { type: type, width: w, height: h }
   }
 
   function clearArtwork() {
@@ -617,7 +683,9 @@ Item {
     loading = true
     statusMessage = ""
     request("/library/sections", {}, function (response) {
-      var sections = PlexApi.musicSections(response)
+      // Each library is measured with its own request; a server listing
+      // thousands would keep those going for hours.
+      var sections = PlexApi.musicSections(response).slice(0, 25)
       if (!sections.length) {
         root.loading = false
         root.statusMessage = "No music library found on " + root.serverName

@@ -9,8 +9,10 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import struct
 import threading
 import time
+import zlib
 import unittest
 
 REPO = Path(__file__).resolve().parents[1]
@@ -323,6 +325,16 @@ class WaveformBoundsTests(unittest.TestCase):
         self.assertNotRegex(source, r'curl[^\n]*\|')
 
 
+def _png(width, height, rows=None):
+    """A valid PNG; rows=None stores every declared row, so it really decodes."""
+    raw = b''.join(b'\x00' + b'\x00' * (width * 3) for _ in range(height if rows is None else rows))
+
+    def chunk(kind, data):
+        return struct.pack('>I', len(data)) + kind + data + struct.pack('>I', zlib.crc32(kind + data))
+    return (b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', width, height, 8, 2, 0, 0, 0))
+            + chunk(b'IDAT', zlib.compress(raw, 9)) + chunk(b'IEND', b''))
+
+
 class _PlexApiHandler(http.server.BaseHTTPRequestHandler):
     """A Plex server that misbehaves in each of the ways the shell must survive."""
     protocol_version = 'HTTP/1.1'
@@ -339,10 +351,17 @@ class _PlexApiHandler(http.server.BaseHTTPRequestHandler):
                 self.send_header('Content-Length', str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
-            elif path == '/cover.jpg':
-                body = self.server.cover
+            elif path in ('/cover.jpg', '/bomb.png', '/small.png', '/huge.jpg', '/text.jpg'):
+                body = self.server.images[path]
                 self.send_response(200)
+                # Always claims JPEG: the format has to come from the bytes.
                 self.send_header('Content-Type', 'image/jpeg')
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            elif path == '/long':
+                body = json.dumps({'MediaContainer': {'title': 'x' * 900000, 'key': '/k'}}).encode()
+                self.send_response(200)
                 self.send_header('Content-Length', str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
@@ -399,10 +418,18 @@ class PlexApiBoundsTests(unittest.TestCase):
         cls.server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), _PlexApiHandler)
         cls.server.daemon_threads = True
         # A real 64x64 JPEG, so the test proves Image can decode what arrives.
-        cls.server.cover = subprocess.run(
+        cover = subprocess.run(
             ['ffmpeg', '-v', 'error', '-f', 'lavfi', '-i', 'color=c=0xC81E5A:s=64x64',
              '-frames:v', '1', '-f', 'mjpeg', '-'],
             capture_output=True, check=True, timeout=30).stdout
+        # Same JPEG with its frame header claiming 65000x65000.
+        sof = cover.index(b'\xff\xc0')
+        huge = cover[:sof + 5] + struct.pack('>HH', 65000, 65000) + cover[sof + 9:]
+        cls.server.images = {
+            '/cover.jpg': cover, '/huge.jpg': huge, '/small.png': _png(64, 64),
+            # 8000x8000 declared, 187 KB on the wire: 256 MB once decoded.
+            '/bomb.png': _png(8000, 8000), '/text.jpg': b'<html>not an image</html>',
+        }
         threading.Thread(target=cls.server.serve_forever, daemon=True).start()
         cls.base = 'http://127.0.0.1:%d' % cls.server.server_address[1]
 
@@ -415,12 +442,14 @@ class PlexApiBoundsTests(unittest.TestCase):
         source = (REPO / 'Service.qml').read_text()
         pieces = []
         for pattern in (r'^  function apiRequest\([^]*?^  }$',
+                        r'^  function clipStrings\([^]*?^  }$',
                         r'^  function fetchBounded\([^]*?^  }$',
                         r'^  function artwork\([^]*?^  }$',
                         r'^  function loadArtwork\([^]*?^  }$',
                         r'^  function clearArtwork\([^]*?^  }$',
                         r'^  function base64\([^]*?^  }$',
                         r'^  function validPeaks\([^]*?^  }$',
+                        r'^  function imageHeader\([^]*?^  }$',
                         r'^  function expireRequests\([^]*?^  }$',
                         r'^  function cancelRequests\([^]*?^  }$',
                         r'^  Timer \{\n    id: requestDeadline[^]*?^  }$'):
@@ -441,9 +470,11 @@ class PlexApiBoundsTests(unittest.TestCase):
               readonly property int apiTimeoutMs: %(timeout)d
               readonly property int apiMaxResponseBytes: %(cap)d
               readonly property int apiMaxInFlightBytes: %(budget)d
+              readonly property int apiMaxStringLength: 2000
               readonly property int artMaxBytes: %(cap)d
               readonly property int artCacheChars: 8 * 1024 * 1024
               readonly property int artRetryMs: 300000
+              readonly property int artMaxPixels: 2048
               property int artRevision: 0
               property var _art: ({})
               property var _artOrder: []
@@ -502,6 +533,14 @@ class PlexApiBoundsTests(unittest.TestCase):
         for path in ('/declared', '/endless'):
             self.assertLess(results[path]['ms'], self.TIMEOUT_MS)
 
+    def test_long_strings_are_clipped_before_reaching_labels(self):
+        results = self.run_requests('/long')
+        outcome = results['/long']['outcome']
+        self.assertTrue(outcome.startswith('ok '), outcome[:200])
+        container = json.loads(outcome[3:])['MediaContainer']
+        self.assertEqual(len(container['title']), 2000)
+        self.assertEqual(container['key'], '/k')
+
     def test_replies_under_the_cap_share_one_budget(self):
         # Four 700 KiB replies are each allowed alone, but together they pass
         # the 2 MiB in-flight budget; whichever pushes it over is refused.
@@ -537,7 +576,8 @@ class PlexApiBoundsTests(unittest.TestCase):
         base = self.base
         output = self.run_qml([], extra=textwrap.dedent('''\
               property var covers: ({ good: %(good)s, endless: %(endless)s,
-                                      trickle: %(trickle)s, foreign: "http://127.0.0.2:9/x.jpg" })
+                                      trickle: %(trickle)s, foreign: "http://127.0.0.2:9/x.jpg",
+                                      png: %(png)s, bomb: %(bomb)s, huge: %(huge)s, text: %(text)s })
               Image {
                 id: shown
                 source: root.artwork(root.covers.good)
@@ -573,10 +613,14 @@ class PlexApiBoundsTests(unittest.TestCase):
                   Qt.quit()
                 }
               }''') % {'good': json.dumps(base + '/cover.jpg'), 'endless': json.dumps(base + '/endless'),
-                          'trickle': json.dumps(base + '/trickle'), 'wait': self.TIMEOUT_MS + 1500})
+                          'trickle': json.dumps(base + '/trickle'), 'png': json.dumps(base + '/small.png'),
+                          'bomb': json.dumps(base + '/bomb.png'), 'huge': json.dumps(base + '/huge.jpg'),
+                          'text': json.dumps(base + '/text.jpg'), 'wait': self.TIMEOUT_MS + 1500})
         art = json.loads(output.split('ART ', 1)[1].splitlines()[0])
+        # The PNG is labelled image/jpeg by the server; the bytes decide.
         self.assertEqual(art, {'good': 'data:image/jpeg;base64,', 'endless': '', 'trickle': '',
-                               'foreign': '', 'image': 48, 'pending': 0}, output)
+                               'foreign': '', 'png': 'data:image/png;base64,i', 'bomb': '',
+                               'huge': '', 'text': '', 'image': 48, 'pending': 0}, output)
         import base64
         encoded = json.loads(output.split('B64 ', 1)[1].splitlines()[0])
         expected = [base64.b64encode(v).decode() for v in

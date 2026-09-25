@@ -240,7 +240,7 @@ case "${1:-login}" in
   *) fail "unknown command: $1" ;;
 esac
 
-pin_response="$(curl -sfL --proto '=https' --proto-redir '=https' --max-redirs 3 \
+pin_response="$(curl -q -sfL --proto '=https' --proto-redir '=https' --max-redirs 3 \
   --max-time 20 --max-filesize "$MAX_RESPONSE_BYTES" -X POST "${plex_headers[@]}" \
   "https://plex.tv/api/v2/pins")" || fail "could not reach plex.tv to start sign-in"
 
@@ -271,7 +271,7 @@ deadline=$(( $(date +%s) + expires_in ))
 auth_token=""
 while (( $(date +%s) < deadline )); do
   sleep 2
-  check="$(curl -sfL --proto '=https' --proto-redir '=https' --max-redirs 3 \
+  check="$(curl -q -sfL --proto '=https' --proto-redir '=https' --max-redirs 3 \
     --max-time 10 --max-filesize "$MAX_RESPONSE_BYTES" "${plex_headers[@]}" \
     "https://plex.tv/api/v2/pins/${pin_id}")" || continue
   auth_token="$(printf '%s' "$check" | jq -r '.authToken // empty')"

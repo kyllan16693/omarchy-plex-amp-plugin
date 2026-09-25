@@ -119,7 +119,7 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const assert = require('node:assert/strict');
 const qml = fs.readFileSync(process.argv[1], 'utf8');
-const pieces = ['apiRequest', 'fetchBounded'].map(function (name) {
+const pieces = ['apiRequest', 'fetchBounded', 'clipStrings'].map(function (name) {
   const found = qml.match(new RegExp('^  function ' + name + '\\([^]*?^  }', 'm'));
   assert.ok(found, 'missing QML function ' + name);
   return found[0];
@@ -137,6 +137,7 @@ const context = vm.createContext({
   serverUri: 'http://fixture.invalid:32400', serverToken: 'SYNTHETIC',
   serverName: 'fixture', clientId: 'audit', _sessionGeneration: 0,
   apiTimeoutMs: 30000, apiMaxResponseBytes: 1024, apiMaxInFlightBytes: 2048,
+  apiMaxStringLength: 2000,
   _pendingRequests: [],
   requestDeadline: {start() {}, stop() {}}, Qt: {callLater(fn) { fn(); }},
   XMLHttpRequest: Xhr, PlexApi: {url() { return 'http://fixture.invalid:32400/test'; }},
