@@ -28,7 +28,10 @@ as library data and handed to the image loader as in-memory image data, so the
 URL never reaches Quickshell's image loader or its log. The mpv IPC socket
 lives in the per-user runtime directory (`$XDG_RUNTIME_DIR`, mode `0700`). Authentication tokens reach curl and jq through stdin, without
 appearing in process arguments or exported environment variables.
-Authenticated curl requests do not follow redirects.
+Sign-in and server-discovery requests, which carry the token in a header,
+do not follow redirects. The waveform download follows at most three
+redirects, to http or https only; its token is part of the original URL and
+is not added to a redirect target.
 
 Disabling or removing the plugin stops the supervised player. Removing the
 plugin does not delete credentials or state automatically. Sign

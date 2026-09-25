@@ -74,7 +74,9 @@ MAX_RESPONSE_BYTES=$((4 * 1024 * 1024))
 # to redirect destinations, which must not receive the user's Plex token.
 authenticated_get() {
   local token="$1" seconds="$2" target="$3"
-  [[ "$token" =~ ^[A-Za-z0-9._~-]+$ ]] || return 1
+  # Real tokens are about 20 characters. Every token is checked here before
+  # it is used or saved, and it ends up in each request URL the shell sends.
+  [[ "$token" =~ ^[A-Za-z0-9._~-]{1,512}$ ]] || return 1
   valid_server_uri "$target" || return 1
   printf 'header = "X-Plex-Token: %s"\n' "$token" \
     | curl -q --config - -sf --max-time "$seconds" --max-filesize "$MAX_RESPONSE_BYTES" \

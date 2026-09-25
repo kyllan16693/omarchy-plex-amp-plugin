@@ -507,9 +507,13 @@ Item {
         if (onFailure) onFailure(pending.error)
         return
       }
-      // The final chunk can arrive together with DONE. This reply has left
-      // the shared budget, so only its own cap applies now.
-      if (xhr.response && xhr.response.byteLength > maxBytes) {
+      // A reply can arrive whole with DONE, never passing through LOADING,
+      // so both caps apply here too: its own, and the budget it shares with
+      // whatever is still in flight.
+      var size = xhr.response ? xhr.response.byteLength : 0
+      var others = 0
+      for (var i = 0; i < root._pendingRequests.length; i++) others += root._pendingRequests[i].bytes
+      if (size > maxBytes || size + others > root.apiMaxInFlightBytes) {
         if (onFailure) onFailure("response from Plex was too large")
         return
       }
@@ -578,6 +582,8 @@ Item {
   // For Image.source bindings: the cover as a data: URL once it has arrived,
   // "" until then or if it can't be had.
   function artwork(url) {
+    // Unused, but not dead: reading artRevision is what makes each calling
+    // binding re-evaluate when a cover arrives. Removing it freezes covers.
     var revision = artRevision
     if (!url) return ""
     var entry = _art[url]
@@ -638,6 +644,8 @@ Item {
       while (i + 9 < n && bytes[i] === 0xFF) {
         var marker = bytes[i + 1]
         if (marker === 0xFF) { i++; continue }
+        // TEM and RSTn stand alone, with no length word after them.
+        if (marker === 0x01 || (marker >= 0xD0 && marker <= 0xD7)) { i += 2; continue }
         var length = (bytes[i + 2] << 8) | bytes[i + 3]
         if (marker >= 0xC0 && marker <= 0xCF && marker !== 0xC4 && marker !== 0xC8 && marker !== 0xCC) {
           h = (bytes[i + 5] << 8) | bytes[i + 6]
@@ -1303,8 +1311,12 @@ Item {
     if (onReply) {
       _requestSeq++
       payload["request_id"] = _requestSeq
+      // Replies can go missing (mpv restarted or stopped answering) and the
+      // position poll asks twice a second, so only the newest callbacks are
+      // kept. Keys are increasing integers, which Object.keys lists in order.
       var next = {}
-      for (var k in _requests) next[k] = _requests[k]
+      var keys = Object.keys(_requests)
+      for (var k = Math.max(0, keys.length - 31); k < keys.length; k++) next[keys[k]] = _requests[keys[k]]
       next[String(_requestSeq)] = onReply
       _requests = next
     }
@@ -1393,8 +1405,8 @@ Item {
       if (typeof data === "number" && data > 0) duration = data
       break
     case "volume":
-      if (typeof data === "number") {
-        var v = Math.round(data)
+      if (typeof data === "number" && isFinite(data)) {
+        var v = Math.max(0, Math.min(100, Math.round(data)))
         if (v !== volume) { volume = v; persistState() }
       }
       break
@@ -1907,6 +1919,10 @@ Item {
     // The deadline timer dies with this object, so nothing would bound a
     // request left running.
     cancelRequests()
+    // Sign-in can poll plex.tv for half an hour and then write credentials;
+    // neither helper may outlive the plugin.
+    if (authProcess.running) authProcess.signal(15)
+    if (serverProcess.running) serverProcess.signal(15)
     // The supervisor survives refreshes, and observes disable/removal even
     // after this QML object and the installed helper files have disappeared.
     if (waveProcess.running) waveProcess.signal(15)

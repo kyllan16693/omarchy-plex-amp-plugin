@@ -174,6 +174,21 @@ class CredentialTransportTests(unittest.TestCase):
         probes = [c for c in self.calls() if c['tool'] == 'curl' and c['argv'][-1].endswith('/identity')]
         self.assertEqual(len(probes), 25)
 
+    def test_oversized_tokens_are_never_used_or_saved(self):
+        # Real tokens are about 20 characters; this one would go into every URL.
+        original = self.auth.read_text()
+        huge = 'A' * 600
+        resources = [{'name': 'Big', 'provides': 'server', 'accessToken': huge, 'owned': True,
+                      'connections': [{'uri': 'https://plex.example.invalid:32400', 'local': True,
+                                       'protocol': 'https'}]}]
+        env = dict(self.env, AMPBAR_TEST_RESOURCES=json.dumps(resources))
+        result = subprocess.run([str(REPO / 'bin/plexamp-auth'), 'rediscover'], env=env,
+                                capture_output=True, text=True, timeout=10)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.auth.read_text(), original)
+        for call in self.calls():
+            self.assertNotIn(huge, call.get('stdin', ''))
+
     def test_logout_removes_credentials(self):
         result = self.run_auth('logout')
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -405,8 +420,11 @@ class _PlexApiHandler(http.server.BaseHTTPRequestHandler):
             pass
 
 
-@unittest.skipUnless((shutil.which('qml6') or shutil.which('qml')) and shutil.which('ffmpeg'),
-                     'needs the qml runtime and ffmpeg')
+# These are the only tests of Service.qml's request path. AMPBAR_REQUIRE_QT=1
+# turns a missing runtime into a failure, so CI can't pass them by skipping.
+@unittest.skipUnless(((shutil.which('qml6') or shutil.which('qml')) and shutil.which('ffmpeg'))
+                     or os.environ.get('AMPBAR_REQUIRE_QT'),
+                     'needs the qml runtime and ffmpeg (set AMPBAR_REQUIRE_QT=1 to fail instead)')
 class PlexApiBoundsTests(unittest.TestCase):
     """Service.qml's real request code, run under Qt against a hostile server."""
     TIMEOUT_MS = 2000
@@ -641,11 +659,17 @@ class PlexApiBoundsTests(unittest.TestCase):
                                good.map(function (v, k) { return k === 3 ? "0.5" : v }),
                                good.map(function (v, k) { return k === 3 ? NaN : v }), null, {}]
                   console.log("PEAKS " + JSON.stringify(cases.map(root.validPeaks)))
+                  // SOI, then a standalone TEM marker, then a 32x16 frame header.
+                  var jpeg = [0xFF, 0xD8, 0xFF, 0x01, 0xFF, 0xC0, 0x00, 0x11, 0x08,
+                              0x00, 0x10, 0x00, 0x20, 0x03]
+                  console.log("TEM " + JSON.stringify(root.imageHeader(jpeg)))
                   Qt.quit()
                 }
               }'''))
         verdicts = json.loads(output.split('PEAKS ', 1)[1].splitlines()[0])
         self.assertEqual(verdicts, [True, False, False, False, False, False, False, False])
+        header = json.loads(output.split('TEM ', 1)[1].splitlines()[0])
+        self.assertEqual(header, {'type': 'image/jpeg', 'width': 32, 'height': 16})
 
     def test_failed_covers_do_not_accumulate(self):
         output = self.run_qml([], extra=textwrap.dedent('''\
@@ -700,6 +724,9 @@ class PlexApiBoundsTests(unittest.TestCase):
             match = re.search(block, source, re.M)
             self.assertIsNotNone(match, block)
             self.assertIn('cancelRequests()', match.group(0))
+        teardown = re.search(r'^  Component\.onDestruction: \{[\s\S]*?^  }$', source, re.M).group(0)
+        self.assertIn('authProcess.signal(15)', teardown)
+        self.assertIn('serverProcess.signal(15)', teardown)
 
 
 if __name__ == '__main__':

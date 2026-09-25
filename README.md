@@ -311,6 +311,10 @@ Plex server, silent audio, and never touch the running desktop:
 python3 -m unittest discover -s tests -v
 ```
 
+`PlexApiBoundsTests` run the real request code under Qt, so they need `qml6`
+and `ffmpeg`; without them they skip. Set `AMPBAR_REQUIRE_QT=1` (as CI should)
+to make a missing runtime fail instead.
+
 The fresh-install smoke test drives the real Service in an offscreen Quickshell
 against a real mpv, so it needs Omarchy, Quickshell, mpv, ffmpeg, curl, and jq.
 
