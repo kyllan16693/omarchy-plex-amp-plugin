@@ -81,7 +81,7 @@ class EngineLifecycleTests(unittest.TestCase):
         try:
             probe.bind(str(self.runtime / "probe.sock"))
         except PermissionError:
-            self.skipTest("sandbox blocks private Unix socket binding")
+            self.fail("sandbox blocks private Unix socket binding")
         finally:
             probe.close()
         (self.runtime / "probe.sock").unlink()
@@ -300,8 +300,8 @@ class EngineLifecycleTests(unittest.TestCase):
         self.assertEqual(victim.stat().st_mode & 0o777, 0o640)
         self.assertEqual(self.players(), [])
 
-    @unittest.skipUnless(REAL_MPV, "mpv is not installed")
     def test_real_mpv_plays_local_silence_through_launcher_exit(self):
+        self.assertTrue(REAL_MPV, "this test needs mpv")
         self.fake.write_text("#!/usr/bin/env python3\n"
                              "import os, sys\n"
                              f"os.execv({REAL_MPV!r}, [{REAL_MPV!r}, '--ao=null'] + sys.argv[1:])\n")

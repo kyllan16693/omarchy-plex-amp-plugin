@@ -111,8 +111,12 @@ else:
         self.assert_logout_cancels("rediscover")
 
 
-@unittest.skipUnless(shutil.which("node"), "node is required for QML JS fixtures")
 class QmlRequestRaceTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        if not shutil.which("node"):
+            raise RuntimeError("node is required for the QML JS fixtures")
+
     def test_session_reset_ignores_late_callbacks(self):
         script = r"""
 const fs = require('node:fs');
@@ -185,6 +189,30 @@ const keys = Object.keys(context._requests).map(Number);
 assert.equal(keys.length, 32);
 assert.deepEqual(keys, Array.from({length: 32}, (_, i) => 969 + i));
 assert.equal(written.length, 1000);
+"""
+        result = subprocess.run(["node", "-e", script, str(REPO / "Service.qml")],
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_tint_cache_evicts_the_least_recently_shown_album(self):
+        # Album keys are Plex rating keys, integer-like strings that
+        # Object.keys would otherwise list in numeric order.
+        script = r"""
+const fs = require('node:fs');
+const vm = require('node:vm');
+const assert = require('node:assert/strict');
+const qml = fs.readFileSync(process.argv[1], 'utf8');
+const found = qml.match(/^  function rememberTint\([^]*?^  }/m);
+assert.ok(found, 'missing QML function rememberTint');
+const context = vm.createContext({_tintCache: {}, tintCacheSize: 60});
+vm.runInContext(found[0], context);
+for (let key = 1000; key < 1060; key++) context.rememberTint(String(key), key);
+context.rememberTint('1000', 1000);  // shown again, so now the newest
+context.rememberTint('7', 7);        // a low key must still be kept
+const keys = Object.keys(context._tintCache);
+assert.equal(keys.length, 60);
+assert.ok(!keys.includes('album:1001'), 'oldest album was kept');
+assert.deepEqual(keys.slice(-2), ['album:1000', 'album:7']);
 """
         result = subprocess.run(["node", "-e", script, str(REPO / "Service.qml")],
                                 capture_output=True, text=True, timeout=10)

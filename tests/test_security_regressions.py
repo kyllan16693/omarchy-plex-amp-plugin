@@ -16,6 +16,13 @@ import zlib
 import unittest
 
 REPO = Path(__file__).resolve().parents[1]
+
+
+def require(*names):
+    # Missing tools are an error, never a skip: a skipped guard reads as green.
+    missing = [name for name in names if not shutil.which(name)]
+    if missing:
+        raise RuntimeError('these tests need ' + ', '.join(missing))
 ACCOUNT_TOKEN = 'SYNTHETIC_ACCOUNT_TOKEN'
 SERVER_TOKEN = 'SYNTHETIC_SERVER_TOKEN'
 
@@ -217,12 +224,12 @@ class _MediaHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(data)
 
 
-@unittest.skipUnless(shutil.which('ffmpeg') and shutil.which('curl'), 'needs ffmpeg and curl')
 class WaveformBoundsTests(unittest.TestCase):
     """A server can make the waveform helper fail, never grow without bound."""
 
     @classmethod
     def setUpClass(cls):
+        require('ffmpeg', 'curl')
         cls.server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), _MediaHandler)
         # The helper hanging up mid-transfer is the behaviour under test.
         cls.server.handle_error = lambda *args: None
@@ -420,11 +427,8 @@ class _PlexApiHandler(http.server.BaseHTTPRequestHandler):
             pass
 
 
-# These are the only tests of Service.qml's request path. AMPBAR_REQUIRE_QT=1
-# turns a missing runtime into a failure, so CI can't pass them by skipping.
-@unittest.skipUnless(((shutil.which('qml6') or shutil.which('qml')) and shutil.which('ffmpeg'))
-                     or os.environ.get('AMPBAR_REQUIRE_QT'),
-                     'needs the qml runtime and ffmpeg (set AMPBAR_REQUIRE_QT=1 to fail instead)')
+# These are the only tests of Service.qml's request path, so a missing runtime
+# is an error rather than a skip.
 class PlexApiBoundsTests(unittest.TestCase):
     """Service.qml's real request code, run under Qt against a hostile server."""
     TIMEOUT_MS = 2000
@@ -433,6 +437,9 @@ class PlexApiBoundsTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        if not (shutil.which('qml6') or shutil.which('qml')):
+            raise RuntimeError('these tests need qml6 (qt6-declarative)')
+        require('ffmpeg')
         cls.server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), _PlexApiHandler)
         cls.server.daemon_threads = True
         # A real 64x64 JPEG, so the test proves Image can decode what arrives.
@@ -727,6 +734,18 @@ class PlexApiBoundsTests(unittest.TestCase):
         teardown = re.search(r'^  Component\.onDestruction: \{[\s\S]*?^  }$', source, re.M).group(0)
         self.assertIn('authProcess.signal(15)', teardown)
         self.assertIn('serverProcess.signal(15)', teardown)
+
+
+class InstallTests(unittest.TestCase):
+    def test_every_helper_is_installed(self):
+        # install.sh names the helpers so that a stray bin/__pycache__ can't
+        # stop it, which means a new helper has to be added there by hand.
+        script = (REPO / 'install.sh').read_text()
+        helpers = [path.name for path in (REPO / 'bin').iterdir()
+                   if path.is_file() and os.access(path, os.X_OK)]
+        self.assertTrue(helpers)
+        for name in helpers:
+            self.assertIn(f'"$SRC/bin/{name}"', script, f'install.sh does not ship bin/{name}')
 
 
 if __name__ == '__main__':

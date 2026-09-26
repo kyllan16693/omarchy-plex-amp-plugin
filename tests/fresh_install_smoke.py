@@ -82,7 +82,7 @@ class FreshInstallSmoke(unittest.TestCase):
         missing = [name for name in ("quickshell", "mpv", "ffmpeg", "curl", "jq", "omarchy")
                    if not shutil.which(name)]
         if missing or not (OMARCHY / "shell/Ui").is_dir():
-            raise unittest.SkipTest("requires installed Omarchy + " + ", ".join(missing))
+            raise RuntimeError("requires installed Omarchy + " + ", ".join(missing))
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="ampbar-fresh-")

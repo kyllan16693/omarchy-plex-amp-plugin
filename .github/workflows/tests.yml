@@ -1,0 +1,22 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    # Arch ships the same Qt, mpv and ffmpeg that Omarchy runs.
+    container: archlinux:latest
+    steps:
+      - name: Install dependencies
+        run: pacman -Syu --noconfirm --needed git python qt6-declarative ffmpeg mpv nodejs curl jq
+      - uses: actions/checkout@v4
+      # As a normal user: root would sail through the permission checks.
+      # A missing tool fails the run; no test is ever skipped.
+      - name: Run the tests
+        run: |
+          useradd --create-home ci
+          chown -R ci .
+          su ci -c 'QT_QPA_PLATFORM=offscreen python3 -m unittest discover -s tests -v'

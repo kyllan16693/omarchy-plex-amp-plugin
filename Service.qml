@@ -420,6 +420,9 @@ Item {
     fetchBounded(method, target, "application/json", apiMaxResponseBytes, function (xhr) {
       var parsed = null
       try {
+        // Qt serves responseText with an arraybuffer responseType (the spec
+        // would throw) and has no TextDecoder. PlexApiBoundsTests parse real
+        // replies this way, so a Qt that tightens this fails there first.
         parsed = root.clipStrings(JSON.parse(xhr.responseText))
       } catch (e) {
         if (onFailure) onFailure("unreadable response from Plex")
@@ -1200,8 +1203,9 @@ Item {
     }
     if (_tintAlbumKey === track.albumKey) return
     _tintAlbumKey = track.albumKey
-    var cached = _tintCache[track.albumKey]
+    var cached = _tintCache["album:" + track.albumKey]
     if (cached !== undefined) {
+      rememberTint(track.albumKey, cached)
       tint = cached
       return
     }
@@ -1209,17 +1213,28 @@ Item {
     request("/library/metadata/" + albumKey, {}, function (response) {
       var items = PlexApi.metadataList(response)
       var colors = items.length ? PlexApi.ultraBlur(items[0]) : null
-      // Bounded like waveCache: radio can visit new albums indefinitely.
-      var next = {}
-      var keys = Object.keys(root._tintCache)
-      for (var i = Math.max(0, keys.length - 60); i < keys.length; i++)
-        next[keys[i]] = root._tintCache[keys[i]]
-      next[albumKey] = colors
-      root._tintCache = next
+      root.rememberTint(albumKey, colors)
       if (root._tintAlbumKey === albumKey) root.tint = colors
     }, function () {
       if (root._tintAlbumKey === albumKey) root.tint = null
     })
+  }
+
+  // Bounded like waveCache, since radio can visit new albums indefinitely, and
+  // evicts the least recently shown. Keys carry a prefix because Object.keys
+  // lists integer-like keys (Plex rating keys) in numeric order, not insertion
+  // order. The map is rebuilt rather than edited: Qt keeps a deleted and
+  // re-added key in its old position.
+  readonly property int tintCacheSize: 60
+
+  function rememberTint(albumKey, colors) {
+    var key = "album:" + albumKey
+    var keys = Object.keys(_tintCache).filter(function (k) { return k !== key })
+    var next = {}
+    for (var i = Math.max(0, keys.length - tintCacheSize + 1); i < keys.length; i++)
+      next[keys[i]] = _tintCache[keys[i]]
+    next[key] = colors
+    _tintCache = next
   }
 
   // ============================================================== mpv engine
