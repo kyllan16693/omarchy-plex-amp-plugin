@@ -313,7 +313,7 @@ python3 -m unittest discover -s tests -v
 
 They need `qml6` (qt6-declarative), `node`, `mpv`, `ffmpeg`, `curl` and `jq`.
 No test skips: a missing tool is an error, so a green run means every guard
-ran. `.github/workflows/tests.yml` runs the suite on Arch.
+ran.
 
 The fresh-install smoke test drives the real Service in an offscreen Quickshell
 against a real mpv, so it needs Omarchy, Quickshell, mpv, ffmpeg, curl, and jq.
