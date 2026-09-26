@@ -1,7 +1,7 @@
 # Marketplace listing
 
-- **Category:** Widgets
-- **Tags:** media, bar, quickshell
+- **Category:** Other
+- **Tags:** Media
 - **Name:** Ampbar for Plex
 
 Use these values when submitting the repository to the Omarchy Plugin

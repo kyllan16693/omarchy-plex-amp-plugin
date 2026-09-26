@@ -46,7 +46,7 @@ Radio — seeded and library stations:
 ## Install
 
 ```sh
-omarchy plugin add https://github.com/kyllan/ampbar-for-plex-omarchy.git --enable
+omarchy plugin add https://github.com/kyllan16693/omarchy-plex-amp-plugin.git --enable
 ```
 
 Omarchy clones, validates, and enables the plugin. Add the **Ampbar for Plex** widget to your bar from
@@ -250,6 +250,19 @@ Omarchy's `shell.json`. Disabling or removing the plugin shuts down mpv. A
 temporarily unreadable shell configuration gets five seconds to recover before
 the player stops.
 
+## Plex requests
+
+Library, search, and play-queue requests run inside the shell, so each one is
+bounded too: a reply must arrive within 30 seconds in total and stay under
+16 MiB (about 12,000 tracks' worth), and everything in flight together must stay
+under 32 MiB, or the request is aborted and reported as an error rather than
+parsed. Cover art takes the same path, capped at 2 MiB per cover (Plex's
+largest transcodes are about 0.5 MB), and reaches the panel as in-memory image
+data, so the shell's image loader never fetches from the network. Signing out or
+unloading the plugin cancels anything still in flight. Sign-in replies from
+plex.tv are capped at 4 MiB, and the waveform cache keeps the 2,000 most
+recently played tracks.
+
 ## The waveform
 
 Your server exposes no loudness ramps (that needs Plex's own sonic analysis), so
@@ -297,6 +310,10 @@ Plex server, silent audio, and never touch the running desktop:
 ```sh
 python3 -m unittest discover -s tests -v
 ```
+
+They need `qml6` (qt6-declarative), `node`, `mpv`, `ffmpeg`, `curl` and `jq`.
+No test skips: a missing tool is an error, so a green run means every guard
+ran.
 
 The fresh-install smoke test drives the real Service in an offscreen Quickshell
 against a real mpv, so it needs Omarchy, Quickshell, mpv, ffmpeg, curl, and jq.

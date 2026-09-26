@@ -40,7 +40,8 @@ cp "$SRC/manifest.json" "$SRC"/*.qml "$SRC"/*.js "$SRC/preview.png" \
 mkdir -p "$STAGE/assets"
 cp -R "$SRC/assets/screenshots" "$STAGE/assets/"
 mkdir -p "$STAGE/bin"
-cp "$SRC"/bin/* "$STAGE/bin/"
+# By name: a stray directory such as bin/__pycache__ would stop cp under set -e.
+cp "$SRC/bin/plexamp-auth" "$SRC/bin/plexamp-engine" "$SRC/bin/plexamp-waveform" "$STAGE/bin/"
 chmod +x "$STAGE"/bin/*
 
 if command -v omarchy >/dev/null 2>&1; then

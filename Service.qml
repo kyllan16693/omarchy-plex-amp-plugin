@@ -222,6 +222,10 @@ Item {
 
   function clearSession() {
     _sessionGeneration++
+    cancelRequests()
+    clearArtwork()
+    _tintCache = ({})
+    _tintAlbumKey = ""
     stop()
     shutdownEngine()
     waveQueue = []
@@ -393,6 +397,18 @@ Item {
 
   // =============================================================== Plex HTTP
 
+  // Plex replies are buffered and parsed inside the shell process, so each
+  // request is bounded in time and size. A server that stalls, trickles, or
+  // streams without end is cut off instead of holding a socket open or
+  // growing the shell's memory. Plex spends about 1.4 KB per track, so the
+  // cap still fits an artist's /allLeaves of some 12,000 tracks. Opening the
+  // panel sends several requests at once, so everything in flight also shares
+  // one budget: many replies each just under the cap cannot add up either.
+  readonly property int apiTimeoutMs: 30000
+  readonly property int apiMaxResponseBytes: 16 * 1024 * 1024
+  readonly property int apiMaxInFlightBytes: 32 * 1024 * 1024
+  property var _pendingRequests: []
+
   function apiRequest(method, path, params, onSuccess, onFailure) {
     if (!serverUri || !serverToken) {
       if (onFailure) onFailure("not connected")
@@ -401,34 +417,274 @@ Item {
     var query = params || {}
     query["X-Plex-Token"] = serverToken
     var target = PlexApi.url(serverUri, path, query)
+    fetchBounded(method, target, "application/json", apiMaxResponseBytes, function (xhr) {
+      var parsed = null
+      try {
+        // Qt serves responseText with an arraybuffer responseType (the spec
+        // would throw) and has no TextDecoder. PlexApiBoundsTests parse real
+        // replies this way, so a Qt that tightens this fails there first.
+        parsed = root.clipStrings(JSON.parse(xhr.responseText))
+      } catch (e) {
+        if (onFailure) onFailure("unreadable response from Plex")
+        return
+      }
+      if (onSuccess) onSuccess(parsed)
+    }, onFailure)
+  }
 
+  // Titles and names end up in labels, and laying out one of several million
+  // characters stalls the shell for seconds. No real field comes close to
+  // this; keys and paths are far shorter. (Qt's JSON.parse ignores a reviver,
+  // so the parsed reply is walked instead.)
+  readonly property int apiMaxStringLength: 2000
+
+  function clipStrings(value) {
+    // Object.keys with indexed loops: four times faster than for-in here,
+    // about 55 ms for a 12,000-track reply against 100 ms to parse it.
+    var max = apiMaxStringLength
+    if (typeof value === "string") return value.length > max ? value.slice(0, max) : value
+    var stack = [value]
+    while (stack.length) {
+      var node = stack.pop()
+      if (node === null || typeof node !== "object") continue
+      var keys = Array.isArray(node) ? null : Object.keys(node)
+      var count = keys ? keys.length : node.length
+      for (var i = 0; i < count; i++) {
+        var key = keys ? keys[i] : i
+        var v = node[key]
+        if (typeof v === "string") {
+          if (v.length > max) node[key] = v.slice(0, max)
+        } else if (v !== null && typeof v === "object") {
+          stack.push(v)
+        }
+      }
+    }
+    return value
+  }
+
+  // Every request to the server goes through here: JSON and cover art alike.
+  // onSuccess receives the finished XMLHttpRequest for a 2xx reply.
+  function fetchBounded(method, target, accept, maxBytes, onSuccess, onFailure) {
     var xhr = new XMLHttpRequest()
     var generation = _sessionGeneration
+    var pending = { xhr: xhr, deadline: Date.now() + apiTimeoutMs, bytes: 0, error: "" }
+    // Qt keeps using the network reply after a readystatechange handler
+    // returns, so aborting from inside one crashes the shell. From a handler
+    // the abort waits for it to unwind; the timer, sign-out, and teardown
+    // abort at once. The reason is recorded first, and DONE (from abort() or
+    // a reply that finishes first) reports it.
+    function cancel(error, immediately) {
+      if (pending.error) return
+      pending.error = error
+      if (immediately) xhr.abort()
+      else Qt.callLater(function () { xhr.abort() })
+    }
+    pending.cancel = cancel
+    function tooLarge() {
+      // An arraybuffer response exposes the bytes received so far without
+      // copying or decoding them, which makes this check cheap per chunk.
+      var body = xhr.response
+      pending.bytes = body ? body.byteLength : 0
+      if (pending.bytes > maxBytes) return true
+      var total = 0
+      for (var i = 0; i < root._pendingRequests.length; i++)
+        total += root._pendingRequests[i].bytes
+      return total > root.apiMaxInFlightBytes
+    }
     xhr.onreadystatechange = function () {
+      if (xhr.readyState === XMLHttpRequest.HEADERS_RECEIVED) {
+        var declared = Number(xhr.getResponseHeader("Content-Length"))
+        if (declared > maxBytes) cancel("response from Plex was too large")
+        return
+      }
+      if (xhr.readyState === XMLHttpRequest.LOADING) {
+        if (tooLarge()) cancel("response from Plex was too large")
+        return
+      }
       if (xhr.readyState !== XMLHttpRequest.DONE) return
+      var at = root._pendingRequests.indexOf(pending)
+      if (at >= 0) root._pendingRequests.splice(at, 1)
+      if (!root._pendingRequests.length) requestDeadline.stop()
       if (generation !== root._sessionGeneration) return
+      if (pending.error) {
+        if (onFailure) onFailure(pending.error)
+        return
+      }
+      // A reply can arrive whole with DONE, never passing through LOADING,
+      // so both caps apply here too: its own, and the budget it shares with
+      // whatever is still in flight.
+      var size = xhr.response ? xhr.response.byteLength : 0
+      var others = 0
+      for (var i = 0; i < root._pendingRequests.length; i++) others += root._pendingRequests[i].bytes
+      if (size > maxBytes || size + others > root.apiMaxInFlightBytes) {
+        if (onFailure) onFailure("response from Plex was too large")
+        return
+      }
       if (xhr.status >= 200 && xhr.status < 300) {
-        var parsed = null
-        try {
-          parsed = JSON.parse(xhr.responseText)
-        } catch (e) {
-          if (onFailure) onFailure("unreadable response from Plex")
-          return
-        }
-        if (onSuccess) onSuccess(parsed)
+        if (onSuccess) onSuccess(xhr)
       } else if (onFailure) {
         onFailure(xhr.status === 0 ? "could not reach " + root.serverName
                                    : "Plex returned HTTP " + xhr.status)
       }
     }
+    xhr.responseType = "arraybuffer"
     xhr.open(method, target)
-    xhr.setRequestHeader("Accept", "application/json")
+    xhr.setRequestHeader("Accept", accept)
     if (clientId) xhr.setRequestHeader("X-Plex-Client-Identifier", clientId)
+    _pendingRequests.push(pending)
+    requestDeadline.running = true
     xhr.send()
+  }
+
+  // One shared clock enforces the total deadline, however slowly the bytes
+  // arrive; per-chunk activity never extends it.
+  function expireRequests(now) {
+    var expired = _pendingRequests.filter(function (p) { return now >= p.deadline })
+    for (var i = 0; i < expired.length; i++)
+      expired[i].cancel("Plex took too long to respond", true)
+    if (!_pendingRequests.length) requestDeadline.stop()
+  }
+
+  // Never called from inside a request's own handler, so it aborts at once.
+  function cancelRequests() {
+    var all = _pendingRequests.slice()
+    for (var i = 0; i < all.length; i++) all[i].cancel("cancelled", true)
+  }
+
+  Timer {
+    id: requestDeadline
+    interval: 1000
+    repeat: true
+    running: false
+    onTriggered: root.expireRequests(Date.now())
   }
 
   function request(path, params, onSuccess, onFailure) {
     apiRequest("GET", path, params, onSuccess, onFailure)
+  }
+
+  // ================================================================ artwork
+
+  // Qt's image loader would buffer a reply of any size with no deadline, so
+  // cover art is fetched through fetchBounded as well and reaches Image as a
+  // data: URL. Plex's 600px transcodes stay under 600 KB (10-70 KB typical).
+  readonly property int artMaxBytes: 2 * 1024 * 1024
+  // Base64 characters kept across all cached covers; far more than a panel
+  // full of covers needs, but a server serving oversized ones still can't
+  // grow it.
+  readonly property int artCacheChars: 32 * 1024 * 1024
+  // A cover that failed or was evicted is not asked for again sooner, so an
+  // oversized cover can't be fetched in a loop.
+  readonly property int artRetryMs: 5 * 60 * 1000
+  // Bumped as covers arrive, so bindings that called artwork() look again.
+  property int artRevision: 0
+  property var _art: ({})     // url -> { data: data: URL or "", at: last fetch }
+  property var _artOrder: []  // cached urls, oldest first
+  property int _artChars: 0
+
+  // For Image.source bindings: the cover as a data: URL once it has arrived,
+  // "" until then or if it can't be had.
+  function artwork(url) {
+    // Unused, but not dead: reading artRevision is what makes each calling
+    // binding re-evaluate when a cover arrives. Removing it freezes covers.
+    var revision = artRevision
+    if (!url) return ""
+    var entry = _art[url]
+    if (entry && (entry.data || Date.now() - entry.at < artRetryMs)) return entry.data
+    loadArtwork(url)
+    return ""
+  }
+
+  function loadArtwork(url) {
+    var entry = { data: "", at: Date.now() }
+    // Failed covers keep an empty entry to hold off retries. Drop those once
+    // they have waited out the retry period, so a radio session visiting
+    // thousands of albums can't grow the map without end.
+    var keys = Object.keys(_art)
+    if (keys.length > 1000) {
+      for (var i = 0; i < keys.length; i++) {
+        var old = _art[keys[i]]
+        if (!old.data && entry.at - old.at >= artRetryMs) delete _art[keys[i]]
+      }
+    }
+    _art[url] = entry
+    // Covers only ever come from the signed-in server.
+    if (!serverUri || String(url).indexOf(serverUri + "/") !== 0) return
+    fetchBounded("GET", url, "image/*", artMaxBytes, function (xhr) {
+      var bytes = new Uint8Array(xhr.response)
+      var image = root.imageHeader(bytes)
+      if (!image || root._art[url] !== entry) return
+      entry.data = "data:" + image.type + ";base64," + root.base64(bytes)
+      root._artOrder.push(url)
+      root._artChars += entry.data.length
+      while (root._artChars > root.artCacheChars && root._artOrder.length > 1) {
+        var old = root._art[root._artOrder.shift()]
+        root._artChars -= old.data.length
+        old.data = ""
+        old.at = Date.now()
+      }
+      root.artRevision++
+    }, function () {})
+  }
+
+  // Covers are decoded in the shell, and a small file can declare an enormous
+  // image: a 187 KB PNG decodes to 256 MB. The format is taken from the bytes,
+  // not the server's Content-Type, and only JPEG or PNG within artMaxPixels
+  // on each side is handed to Image. Plex's transcodes are 600px JPEGs.
+  readonly property int artMaxPixels: 2048
+
+  function imageHeader(bytes) {
+    var n = bytes.length
+    var w = 0, h = 0, type = ""
+    if (n > 24 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4E && bytes[3] === 0x47
+        && bytes[12] === 0x49 && bytes[13] === 0x48 && bytes[14] === 0x44 && bytes[15] === 0x52) {
+      type = "image/png"
+      w = ((bytes[16] << 24) | (bytes[17] << 16) | (bytes[18] << 8) | bytes[19]) >>> 0
+      h = ((bytes[20] << 24) | (bytes[21] << 16) | (bytes[22] << 8) | bytes[23]) >>> 0
+    } else if (n > 3 && bytes[0] === 0xFF && bytes[1] === 0xD8) {
+      // Walk the JPEG markers to the start-of-frame, which holds the size.
+      var i = 2
+      while (i + 9 < n && bytes[i] === 0xFF) {
+        var marker = bytes[i + 1]
+        if (marker === 0xFF) { i++; continue }
+        // TEM and RSTn stand alone, with no length word after them.
+        if (marker === 0x01 || (marker >= 0xD0 && marker <= 0xD7)) { i += 2; continue }
+        var length = (bytes[i + 2] << 8) | bytes[i + 3]
+        if (marker >= 0xC0 && marker <= 0xCF && marker !== 0xC4 && marker !== 0xC8 && marker !== 0xCC) {
+          h = (bytes[i + 5] << 8) | bytes[i + 6]
+          w = (bytes[i + 7] << 8) | bytes[i + 8]
+          type = "image/jpeg"
+          break
+        }
+        if (length < 2) return null
+        i += 2 + length
+      }
+    }
+    if (!type || w < 1 || h < 1 || w > artMaxPixels || h > artMaxPixels) return null
+    return { type: type, width: w, height: h }
+  }
+
+  function clearArtwork() {
+    _art = ({})
+    _artOrder = []
+    _artChars = 0
+    artRevision++
+  }
+
+  function base64(bytes) {
+    var table = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    var out = []
+    var i = 0
+    for (; i + 2 < bytes.length; i += 3) {
+      var v = (bytes[i] << 16) | (bytes[i + 1] << 8) | bytes[i + 2]
+      out.push(table[v >> 18] + table[(v >> 12) & 63] + table[(v >> 6) & 63] + table[v & 63])
+    }
+    if (i < bytes.length) {
+      var two = i + 1 < bytes.length
+      var r = (bytes[i] << 16) | ((two ? bytes[i + 1] : 0) << 8)
+      out.push(table[r >> 18] + table[(r >> 12) & 63] + (two ? table[(r >> 6) & 63] : "=") + "=")
+    }
+    return out.join("")
   }
 
   // ============================================================== libraries
@@ -438,7 +694,9 @@ Item {
     loading = true
     statusMessage = ""
     request("/library/sections", {}, function (response) {
-      var sections = PlexApi.musicSections(response)
+      // Each library is measured with its own request; a server listing
+      // thousands would keep those going for hours.
+      var sections = PlexApi.musicSections(response).slice(0, 25)
       if (!sections.length) {
         root.loading = false
         root.statusMessage = "No music library found on " + root.serverName
@@ -853,10 +1111,21 @@ Item {
         } catch (e) {
           return
         }
-        if (msg.stage !== "waveform" || !Array.isArray(msg.peaks)) return
+        if (msg.stage !== "waveform" || !root.validPeaks(msg.peaks)) return
         root.rememberWaveform(String(msg.ratingKey), msg.peaks)
       }
     }
+  }
+
+  // The helper always draws 120 buckets in [0, 1]; a cache file of any other
+  // shape, however it got there, is ignored rather than drawn.
+  function validPeaks(peaks) {
+    if (!Array.isArray(peaks) || peaks.length !== 120) return false
+    for (var i = 0; i < peaks.length; i++) {
+      var v = peaks[i]
+      if (typeof v !== "number" || !(v >= 0 && v <= 1)) return false
+    }
+    return true
   }
 
   function rememberWaveform(key, peaks) {
@@ -934,8 +1203,9 @@ Item {
     }
     if (_tintAlbumKey === track.albumKey) return
     _tintAlbumKey = track.albumKey
-    var cached = _tintCache[track.albumKey]
+    var cached = _tintCache["album:" + track.albumKey]
     if (cached !== undefined) {
+      rememberTint(track.albumKey, cached)
       tint = cached
       return
     }
@@ -943,14 +1213,28 @@ Item {
     request("/library/metadata/" + albumKey, {}, function (response) {
       var items = PlexApi.metadataList(response)
       var colors = items.length ? PlexApi.ultraBlur(items[0]) : null
-      var next = {}
-      for (var k in root._tintCache) next[k] = root._tintCache[k]
-      next[albumKey] = colors
-      root._tintCache = next
+      root.rememberTint(albumKey, colors)
       if (root._tintAlbumKey === albumKey) root.tint = colors
     }, function () {
       if (root._tintAlbumKey === albumKey) root.tint = null
     })
+  }
+
+  // Bounded like waveCache, since radio can visit new albums indefinitely, and
+  // evicts the least recently shown. Keys carry a prefix because Object.keys
+  // lists integer-like keys (Plex rating keys) in numeric order, not insertion
+  // order. The map is rebuilt rather than edited: Qt keeps a deleted and
+  // re-added key in its old position.
+  readonly property int tintCacheSize: 60
+
+  function rememberTint(albumKey, colors) {
+    var key = "album:" + albumKey
+    var keys = Object.keys(_tintCache).filter(function (k) { return k !== key })
+    var next = {}
+    for (var i = Math.max(0, keys.length - tintCacheSize + 1); i < keys.length; i++)
+      next[keys[i]] = _tintCache[keys[i]]
+    next[key] = colors
+    _tintCache = next
   }
 
   // ============================================================== mpv engine
@@ -994,7 +1278,7 @@ Item {
     }
     if (!engineProcess.running && engineScript) {
       engineProcess.command = [engineScript, "start", socketPath, String(volume),
-        home + "/.config/omarchy/shell.json"]
+        (Quickshell.env("XDG_CONFIG_HOME") || (home + "/.config")) + "/omarchy/shell.json"]
       engineProcess.running = true
     }
     return false
@@ -1042,8 +1326,12 @@ Item {
     if (onReply) {
       _requestSeq++
       payload["request_id"] = _requestSeq
+      // Replies can go missing (mpv restarted or stopped answering) and the
+      // position poll asks twice a second, so only the newest callbacks are
+      // kept. Keys are increasing integers, which Object.keys lists in order.
       var next = {}
-      for (var k in _requests) next[k] = _requests[k]
+      var keys = Object.keys(_requests)
+      for (var k = Math.max(0, keys.length - 31); k < keys.length; k++) next[keys[k]] = _requests[keys[k]]
       next[String(_requestSeq)] = onReply
       _requests = next
     }
@@ -1132,8 +1420,8 @@ Item {
       if (typeof data === "number" && data > 0) duration = data
       break
     case "volume":
-      if (typeof data === "number") {
-        var v = Math.round(data)
+      if (typeof data === "number" && isFinite(data)) {
+        var v = Math.max(0, Math.min(100, Math.round(data)))
         if (v !== volume) { volume = v; persistState() }
       }
       break
@@ -1620,11 +1908,36 @@ Item {
     stateFile.reload()
     authFile.reload()
     // Attach to a player left running by a previous shell instance, but never
-    // create an idle one simply because the plugin has loaded.
-    connectEngine()
+    // create an idle one simply because the plugin has loaded. The engine
+    // vets the socket first, as it does before every other connect.
+    if (engineScript && socketPath) {
+      attachProcess.command = [engineScript, "check", socketPath]
+      attachProcess.running = true
+    }
+  }
+
+  Process {
+    id: attachProcess
+    running: false
+    stderr: SplitParser {
+      splitMarker: "\n"
+      onRead: function (line) {
+        if (String(line || "").trim() !== "") console.warn("plexamp/engine:", line)
+      }
+    }
+    onExited: function (code) {
+      if (code === 0 && !root.ipc) root.connectEngine()
+    }
   }
 
   Component.onDestruction: {
+    // The deadline timer dies with this object, so nothing would bound a
+    // request left running.
+    cancelRequests()
+    // Sign-in can poll plex.tv for half an hour and then write credentials;
+    // neither helper may outlive the plugin.
+    if (authProcess.running) authProcess.signal(15)
+    if (serverProcess.running) serverProcess.signal(15)
     // The supervisor survives refreshes, and observes disable/removal even
     // after this QML object and the installed helper files have disappeared.
     if (waveProcess.running) waveProcess.signal(15)

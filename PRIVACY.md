@@ -22,13 +22,16 @@ state. A stream URL can contain a Plex token; it is retained only in the live
 player, passed to waveform analysis through a mode-`0600` temporary curl
 config, and removed as soon as that request ends. The audio fetched for
 analysis is held in a mode-`0600` temporary file in the same directory and
-deleted once the waveform is built. Artwork is fetched by the
-shell's own image loader with the token in the URL, as Plex requires; if such
-a fetch fails, Quickshell may record the URL in its per-user log under
-`$XDG_RUNTIME_DIR`. The mpv IPC socket lives under the same private
-directory. Authentication tokens reach curl and jq through stdin, without
+deleted once the waveform is built. Artwork URLs carry the token too, as Plex
+requires; covers are fetched through the same size- and time-bounded requests
+as library data and handed to the image loader as in-memory image data, so the
+URL never reaches Quickshell's image loader or its log. The mpv IPC socket
+lives in the per-user runtime directory (`$XDG_RUNTIME_DIR`, mode `0700`). Authentication tokens reach curl and jq through stdin, without
 appearing in process arguments or exported environment variables.
-Authenticated curl requests do not follow redirects.
+Sign-in and server-discovery requests, which carry the token in a header,
+do not follow redirects. The waveform download follows at most three
+redirects, to http or https only; its token is part of the original URL and
+is not added to a redirect target.
 
 Disabling or removing the plugin stops the supervised player. Removing the
 plugin does not delete credentials or state automatically. Sign

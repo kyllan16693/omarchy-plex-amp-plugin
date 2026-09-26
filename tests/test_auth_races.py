@@ -111,29 +111,43 @@ else:
         self.assert_logout_cancels("rediscover")
 
 
-@unittest.skipUnless(shutil.which("node"), "node is required for QML JS fixtures")
 class QmlRequestRaceTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        if not shutil.which("node"):
+            raise RuntimeError("node is required for the QML JS fixtures")
+
     def test_session_reset_ignores_late_callbacks(self):
         script = r"""
 const fs = require('node:fs');
 const vm = require('node:vm');
 const assert = require('node:assert/strict');
 const qml = fs.readFileSync(process.argv[1], 'utf8');
-const match = qml.match(/^  function apiRequest\([^]*?^  }/m);
-assert.ok(match, 'missing QML function apiRequest');
+const pieces = ['apiRequest', 'fetchBounded', 'clipStrings'].map(function (name) {
+  const found = qml.match(new RegExp('^  function ' + name + '\\([^]*?^  }', 'm'));
+  assert.ok(found, 'missing QML function ' + name);
+  return found[0];
+});
 const requests = [];
-function Xhr() { requests.push(this); this.readyState = 0; this.status = 0; }
+function Xhr() { requests.push(this); this.readyState = 0; this.status = 0; this.response = null; }
+Xhr.HEADERS_RECEIVED = 2;
+Xhr.LOADING = 3;
 Xhr.DONE = 4;
 Xhr.prototype.open = function () {};
 Xhr.prototype.setRequestHeader = function () {};
 Xhr.prototype.send = function () {};
+Xhr.prototype.abort = function () {};
 const context = vm.createContext({
   serverUri: 'http://fixture.invalid:32400', serverToken: 'SYNTHETIC',
   serverName: 'fixture', clientId: 'audit', _sessionGeneration: 0,
+  apiTimeoutMs: 30000, apiMaxResponseBytes: 1024, apiMaxInFlightBytes: 2048,
+  apiMaxStringLength: 2000,
+  _pendingRequests: [],
+  requestDeadline: {start() {}, stop() {}}, Qt: {callLater(fn) { fn(); }},
   XMLHttpRequest: Xhr, PlexApi: {url() { return 'http://fixture.invalid:32400/test'; }},
 });
 context.root = context;
-vm.runInContext(match[0], context);
+vm.runInContext(pieces.join('\n'), context);
 let successes = 0, failures = 0;
 function finish(request) {
   request.readyState = Xhr.DONE;
@@ -148,6 +162,101 @@ assert.equal(successes + failures, 0, 'stale callback ran after session reset');
 context.apiRequest('GET', '/new-session', {}, () => successes++, () => failures++);
 finish(requests[1]);
 assert.equal(successes, 1, 'new-session callback was incorrectly discarded');
+"""
+        result = subprocess.run(["node", "-e", script, str(REPO / "Service.qml")],
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_unanswered_mpv_requests_stay_bounded(self):
+        # The position poll registers a callback twice a second; if mpv never
+        # answers, only the newest callbacks may be kept.
+        script = r"""
+const fs = require('node:fs');
+const vm = require('node:vm');
+const assert = require('node:assert/strict');
+const qml = fs.readFileSync(process.argv[1], 'utf8');
+const found = qml.match(/^  function sendCommand\([^]*?^  }/m);
+assert.ok(found, 'missing QML function sendCommand');
+const written = [];
+const context = vm.createContext({
+  _requests: {}, _requestSeq: 0, _pending: [],
+  engineOnline() { return true; }, ensureEngine() {},
+  ipc: {write(line) { written.push(line); }},
+});
+vm.runInContext(found[0], context);
+for (let i = 0; i < 1000; i++) context.sendCommand(['get_property', 'time-pos'], () => {});
+const keys = Object.keys(context._requests).map(Number);
+assert.equal(keys.length, 32);
+assert.deepEqual(keys, Array.from({length: 32}, (_, i) => 969 + i));
+assert.equal(written.length, 1000);
+"""
+        result = subprocess.run(["node", "-e", script, str(REPO / "Service.qml")],
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_tint_cache_evicts_the_least_recently_shown_album(self):
+        # Album keys are Plex rating keys, integer-like strings that
+        # Object.keys would otherwise list in numeric order.
+        script = r"""
+const fs = require('node:fs');
+const vm = require('node:vm');
+const assert = require('node:assert/strict');
+const qml = fs.readFileSync(process.argv[1], 'utf8');
+const found = qml.match(/^  function rememberTint\([^]*?^  }/m);
+assert.ok(found, 'missing QML function rememberTint');
+const context = vm.createContext({_tintCache: {}, tintCacheSize: 60});
+vm.runInContext(found[0], context);
+for (let key = 1000; key < 1060; key++) context.rememberTint(String(key), key);
+context.rememberTint('1000', 1000);  // shown again, so now the newest
+context.rememberTint('7', 7);        // a low key must still be kept
+const keys = Object.keys(context._tintCache);
+assert.equal(keys.length, 60);
+assert.ok(!keys.includes('album:1001'), 'oldest album was kept');
+assert.deepEqual(keys.slice(-2), ['album:1000', 'album:7']);
+"""
+        result = subprocess.run(["node", "-e", script, str(REPO / "Service.qml")],
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_budget_applies_to_replies_that_arrive_whole(self):
+        # Qt can deliver a reply entirely with DONE, skipping LOADING, where
+        # the shared budget is otherwise enforced.
+        script = r"""
+const fs = require('node:fs');
+const vm = require('node:vm');
+const assert = require('node:assert/strict');
+const qml = fs.readFileSync(process.argv[1], 'utf8');
+const found = qml.match(/^  function fetchBounded\([^]*?^  }/m);
+assert.ok(found, 'missing QML function fetchBounded');
+const requests = [];
+function Xhr() { requests.push(this); this.readyState = 0; this.status = 0; this.response = null; }
+Xhr.HEADERS_RECEIVED = 2; Xhr.LOADING = 3; Xhr.DONE = 4;
+Xhr.prototype.open = function () {};
+Xhr.prototype.setRequestHeader = function () {};
+Xhr.prototype.send = function () {};
+Xhr.prototype.abort = function () {};
+const context = vm.createContext({
+  _sessionGeneration: 0, apiTimeoutMs: 30000, apiMaxInFlightBytes: 2048,
+  _pendingRequests: [{bytes: 1500}],  // another reply, still arriving
+  requestDeadline: {start() {}, stop() {}}, Qt: {callLater(fn) { fn(); }},
+  XMLHttpRequest: Xhr, serverName: 'fixture', clientId: 'audit',
+});
+context.root = context;
+vm.runInContext(found[0], context);
+const outcomes = [];
+function finishWhole(bytes) {
+  const request = requests[requests.length - 1];
+  request.readyState = Xhr.DONE; request.status = 200;
+  request.response = {byteLength: bytes};
+  request.onreadystatechange();
+}
+context.fetchBounded('GET', 'http://x/a', 'application/json', 1024,
+  () => outcomes.push('ok'), (e) => outcomes.push(e));
+finishWhole(1000);   // under its own 1024 cap, but 1000 + 1500 > 2048
+context.fetchBounded('GET', 'http://x/b', 'application/json', 1024,
+  () => outcomes.push('ok'), (e) => outcomes.push(e));
+finishWhole(400);    // 400 + 1500 fits
+assert.deepEqual(outcomes, ['response from Plex was too large', 'ok']);
 """
         result = subprocess.run(["node", "-e", script, str(REPO / "Service.qml")],
                                 capture_output=True, text=True, timeout=10)

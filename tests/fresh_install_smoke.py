@@ -82,7 +82,7 @@ class FreshInstallSmoke(unittest.TestCase):
         missing = [name for name in ("quickshell", "mpv", "ffmpeg", "curl", "jq", "omarchy")
                    if not shutil.which(name)]
         if missing or not (OMARCHY / "shell/Ui").is_dir():
-            raise unittest.SkipTest("requires installed Omarchy + " + ", ".join(missing))
+            raise RuntimeError("requires installed Omarchy + " + ", ".join(missing))
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="ampbar-fresh-")
@@ -213,7 +213,7 @@ import os, sys
 from pathlib import Path
 real = Path(__file__).with_name('plexamp-engine-real')
 args = sys.argv[1:4]
-if args[0] != 'stop':
+if args[0] == 'start':
     args += [str(Path(os.environ['AMPBAR_SMOKE_BASE']) / 'config/omarchy/shell.json')]
 os.execv(str(real), [str(real), *args])
 """)

@@ -32,6 +32,7 @@ Item {
     spacing: Style.space(8)
 
     Text {
+      textFormat: Text.PlainText
       Layout.preferredWidth: Style.space(34)
       horizontalAlignment: Text.AlignRight
       text: PlexApi.formatTime(root.plex ? root.plex.position : 0)
@@ -84,6 +85,7 @@ Item {
     }
 
     Text {
+      textFormat: Text.PlainText
       Layout.preferredWidth: Style.space(34)
       text: PlexApi.formatTime(root.plex ? root.plex.duration : 0)
       color: root.dimmer

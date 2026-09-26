@@ -2,16 +2,27 @@
 import json
 import http.server
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
 import sys
 import tempfile
 import textwrap
+import struct
 import threading
+import time
+import zlib
 import unittest
 
 REPO = Path(__file__).resolve().parents[1]
+
+
+def require(*names):
+    # Missing tools are an error, never a skip: a skipped guard reads as green.
+    missing = [name for name in names if not shutil.which(name)]
+    if missing:
+        raise RuntimeError('these tests need ' + ', '.join(missing))
 ACCOUNT_TOKEN = 'SYNTHETIC_ACCOUNT_TOKEN'
 SERVER_TOKEN = 'SYNTHETIC_SERVER_TOKEN'
 
@@ -49,7 +60,13 @@ class CredentialTransportTests(unittest.TestCase):
             with open(os.environ['AMPBAR_TEST_LOG'], 'a') as output:
                 output.write(json.dumps({'tool': 'curl', 'argv': sys.argv[1:],
                                          'stdin': config, 'env': dict(os.environ)}) + '\\n')
-            if '/resources?' in sys.argv[-1]:
+            if sys.argv[-1].endswith('/api/v2/pins') and os.environ.get('AMPBAR_TEST_PIN'):
+                print(os.environ['AMPBAR_TEST_PIN'])
+            elif '/resources?' in sys.argv[-1] and os.environ.get('AMPBAR_TEST_RESOURCES'):
+                print(os.environ['AMPBAR_TEST_RESOURCES'])
+            elif '/identity' in sys.argv[-1] and os.environ.get('AMPBAR_TEST_UNREACHABLE'):
+                sys.exit(7)
+            elif '/resources?' in sys.argv[-1]:
                 print(json.dumps([{'name': 'Synthetic library', 'provides': 'server',
                     'accessToken': 'SYNTHETIC_SERVER_TOKEN', 'owned': True,
                     'connections': [{'uri': 'https://plex.example.invalid:32400',
@@ -57,6 +74,9 @@ class CredentialTransportTests(unittest.TestCase):
             else:
                 print(json.dumps({'MediaContainer': {'machineIdentifier': 'fake-machine'}}))
         ''')
+
+        # Sign-in would otherwise open a browser on the desktop running the tests.
+        self.make_helper('xdg-open', 'pass')
 
     def make_helper(self, name, source):
         target = self.bin / name
@@ -80,6 +100,7 @@ class CredentialTransportTests(unittest.TestCase):
                 self.assertNotIn(token, json.dumps(call.get('env', {})))
             if call['tool'] == 'curl':
                 self.assertEqual(call['argv'][0], '-q')
+                self.assertIn('--max-filesize', call['argv'])
                 self.assertIn('--config', call['argv'])
                 self.assertNotIn('-L', call['argv'])
                 self.assertNotIn('--location', call['argv'])
@@ -126,6 +147,55 @@ class CredentialTransportTests(unittest.TestCase):
         self.assertEqual([call for call in self.calls() if call['tool'] == 'curl'], [])
         self.assertEqual(json.loads(self.auth.read_text()), data)
 
+    def test_hostile_sign_in_code_is_refused_before_use(self):
+        # expiresIn reaches shell arithmetic, which runs command substitutions
+        # in the subscript of any variable that is set, such as HOME.
+        marker = self.root / 'executed'
+        for pin in ({'id': 1, 'code': 'ABCD', 'expiresIn': f'HOME[$(touch {marker})]'},
+                    {'id': '1/../../x', 'code': 'ABCD', 'expiresIn': 900},
+                    {'id': 1, 'code': 'AB&next=https://evil.invalid', 'expiresIn': 900}):
+            with self.subTest(pin=pin):
+                env = dict(self.env, AMPBAR_TEST_PIN=json.dumps(pin))
+                result = subprocess.run([str(REPO / 'bin/plexamp-auth'), 'login'], env=env,
+                                        capture_output=True, text=True, timeout=10)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('unexpected sign-in code', result.stdout)
+                self.assertNotIn('"stage":"pin"', result.stdout)
+                self.assertFalse(marker.exists(), 'plex.tv data was executed')
+        pins = [c for c in self.calls() if c['tool'] == 'curl' and c['argv'][-1].endswith('/pins')]
+        self.assertTrue(pins)
+        for call in pins:
+            self.assertIn('--proto-redir', call['argv'])
+            self.assertIn('--max-filesize', call['argv'])
+
+    def test_server_discovery_stops_after_25_connections(self):
+        # Every probe can take six seconds; plex.tv decides how many there are.
+        connections = [{'uri': f'https://s{i}.plex.invalid:32400', 'local': False,
+                        'protocol': 'https'} for i in range(40)]
+        resources = [{'name': 'x' * 5000, 'provides': 'server', 'accessToken': SERVER_TOKEN,
+                      'owned': True, 'connections': connections}]
+        env = dict(self.env, AMPBAR_TEST_RESOURCES=json.dumps(resources), AMPBAR_TEST_UNREACHABLE='1')
+        result = subprocess.run([str(REPO / 'bin/plexamp-auth'), 'rediscover'], env=env,
+                                capture_output=True, text=True, timeout=30)
+        self.assertNotEqual(result.returncode, 0)
+        probes = [c for c in self.calls() if c['tool'] == 'curl' and c['argv'][-1].endswith('/identity')]
+        self.assertEqual(len(probes), 25)
+
+    def test_oversized_tokens_are_never_used_or_saved(self):
+        # Real tokens are about 20 characters; this one would go into every URL.
+        original = self.auth.read_text()
+        huge = 'A' * 600
+        resources = [{'name': 'Big', 'provides': 'server', 'accessToken': huge, 'owned': True,
+                      'connections': [{'uri': 'https://plex.example.invalid:32400', 'local': True,
+                                       'protocol': 'https'}]}]
+        env = dict(self.env, AMPBAR_TEST_RESOURCES=json.dumps(resources))
+        result = subprocess.run([str(REPO / 'bin/plexamp-auth'), 'rediscover'], env=env,
+                                capture_output=True, text=True, timeout=10)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.auth.read_text(), original)
+        for call in self.calls():
+            self.assertNotIn(huge, call.get('stdin', ''))
+
     def test_logout_removes_credentials(self):
         result = self.run_auth('logout')
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -154,12 +224,12 @@ class _MediaHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(data)
 
 
-@unittest.skipUnless(shutil.which('ffmpeg') and shutil.which('curl'), 'needs ffmpeg and curl')
 class WaveformBoundsTests(unittest.TestCase):
     """A server can make the waveform helper fail, never grow without bound."""
 
     @classmethod
     def setUpClass(cls):
+        require('ffmpeg', 'curl')
         cls.server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), _MediaHandler)
         # The helper hanging up mid-transfer is the behaviour under test.
         cls.server.handle_error = lambda *args: None
@@ -182,7 +252,7 @@ class WaveformBoundsTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.state = Path(self.temp.name) / 'omarchy/plexamp/waveform'
 
-    def run_waveform(self, path, bin_dir=None, **limits):
+    def run_waveform(self, path, bin_dir=None, left_behind=(), **limits):
         env = dict(os.environ, XDG_STATE_HOME=self.temp.name)
         if bin_dir:
             env['PATH'] = str(bin_dir) + os.pathsep + env['PATH']
@@ -191,7 +261,7 @@ class WaveformBoundsTests(unittest.TestCase):
                                 input=self.base + path + '?X-Plex-Token=' + SERVER_TOKEN + '\n',
                                 capture_output=True, text=True, timeout=60)
         self.assertNotIn(SERVER_TOKEN, result.stdout + result.stderr)
-        self.assertEqual([p.name for p in self.state.glob('.*')], [])
+        self.assertEqual(sorted(p.name for p in self.state.glob('.*')), sorted(left_behind))
         return result, json.loads(result.stdout)
 
     def test_track_within_limits_is_analysed_and_cached(self):
@@ -244,13 +314,438 @@ class WaveformBoundsTests(unittest.TestCase):
                 self.assertEqual(message['stage'], 'error')
                 self.assertFalse((self.state / '42.json').exists())
 
+    def test_cache_keeps_only_the_most_recent_tracks(self):
+        self.state.mkdir(parents=True)
+        for key, age in (('7', 500), ('8', 400), ('9', 300), ('10', 200)):
+            stale = self.state / f'{key}.json'
+            stale.write_text('{"peaks":[0.5]}\n')
+            os.utime(stale, (time.time() - age, time.time() - age))
+        result, message = self.run_waveform('/track', AMPBAR_WAVEFORM_MAX_CACHED=3)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(message['stage'], 'waveform')
+        self.assertEqual(sorted(p.name for p in self.state.glob('*.json')),
+                         ['10.json', '42.json', '9.json'])
+
+    def test_leftovers_from_a_killed_analysis_are_swept(self):
+        self.state.mkdir(parents=True)
+        old, fresh = self.state / '.media.abandoned', self.state / '.media.running'
+        for leftover in (old, fresh):
+            leftover.write_bytes(b'x' * 1024)
+        os.utime(old, (time.time() - 7200, time.time() - 7200))
+        # An hour-old download is abandoned; a recent one may be a live run.
+        result, message = self.run_waveform('/track', left_behind=['.media.running'])
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(message['stage'], 'waveform')
+
     def test_limits_cannot_be_raised_from_the_environment(self):
         source = (REPO / 'bin/plexamp-waveform').read_text()
         self.assertIn('AMPBAR_WAVEFORM_MAX_BYTES < MAX_DOWNLOAD_BYTES', source)
         self.assertIn('AMPBAR_WAVEFORM_MAX_SECONDS < MAX_SECONDS', source)
+        self.assertIn('AMPBAR_WAVEFORM_MAX_CACHED < MAX_CACHED_TRACKS', source)
         # No stage may read the whole response or the decoded audio at once.
         self.assertNotIn('stdin.buffer.read()', source)
         self.assertNotRegex(source, r'curl[^\n]*\|')
+
+
+def _png(width, height, rows=None):
+    """A valid PNG; rows=None stores every declared row, so it really decodes."""
+    raw = b''.join(b'\x00' + b'\x00' * (width * 3) for _ in range(height if rows is None else rows))
+
+    def chunk(kind, data):
+        return struct.pack('>I', len(data)) + kind + data + struct.pack('>I', zlib.crc32(kind + data))
+    return (b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', width, height, 8, 2, 0, 0, 0))
+            + chunk(b'IDAT', zlib.compress(raw, 9)) + chunk(b'IEND', b''))
+
+
+class _PlexApiHandler(http.server.BaseHTTPRequestHandler):
+    """A Plex server that misbehaves in each of the ways the shell must survive."""
+    protocol_version = 'HTTP/1.1'
+
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        path = self.path.split('?')[0]
+        try:
+            if path == '/ok':
+                body = json.dumps({'MediaContainer': {'size': 1}}).encode()
+                self.send_response(200)
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            elif path in ('/cover.jpg', '/bomb.png', '/small.png', '/huge.jpg', '/text.jpg'):
+                body = self.server.images[path]
+                self.send_response(200)
+                # Always claims JPEG: the format has to come from the bytes.
+                self.send_header('Content-Type', 'image/jpeg')
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            elif path == '/long':
+                body = json.dumps({'MediaContainer': {'title': 'x' * 900000, 'key': '/k'}}).encode()
+                self.send_response(200)
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            elif path == '/declared':
+                # Claims 100 MiB up front, then waits for the client to hang up.
+                self.send_response(200)
+                self.send_header('Content-Length', str(100 * 1024 * 1024))
+                self.end_headers()
+                self.wfile.write(b'{')
+                self.wfile.flush()
+                time.sleep(15)
+            elif path == '/endless':
+                # Chunked, so no length is ever declared; stops when refused.
+                self.send_response(200)
+                self.send_header('Transfer-Encoding', 'chunked')
+                self.end_headers()
+                chunk = b' ' * 65536
+                for _ in range(4096):
+                    self.wfile.write(b'%x\r\n' % len(chunk) + chunk + b'\r\n')
+                    self.wfile.flush()
+                    time.sleep(0.001)
+            elif path == '/stall':
+                # 700 KiB, under the per-request cap, then nothing more.
+                self.send_response(200)
+                self.send_header('Transfer-Encoding', 'chunked')
+                self.end_headers()
+                chunk = b' ' * (700 * 1024)
+                self.wfile.write(b'%x\r\n' % len(chunk) + chunk + b'\r\n')
+                self.wfile.flush()
+                time.sleep(15)
+            elif path == '/trickle':
+                # One byte a fifth of a second: never idle, never finishing.
+                self.send_response(200)
+                self.send_header('Transfer-Encoding', 'chunked')
+                self.end_headers()
+                for _ in range(150):
+                    self.wfile.write(b'1\r\n \r\n')
+                    self.wfile.flush()
+                    time.sleep(0.2)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+
+# These are the only tests of Service.qml's request path, so a missing runtime
+# is an error rather than a skip.
+class PlexApiBoundsTests(unittest.TestCase):
+    """Service.qml's real request code, run under Qt against a hostile server."""
+    TIMEOUT_MS = 2000
+    MAX_BYTES = 1024 * 1024
+    MAX_IN_FLIGHT = 2 * 1024 * 1024
+
+    @classmethod
+    def setUpClass(cls):
+        if not (shutil.which('qml6') or shutil.which('qml')):
+            raise RuntimeError('these tests need qml6 (qt6-declarative)')
+        require('ffmpeg')
+        cls.server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), _PlexApiHandler)
+        cls.server.daemon_threads = True
+        # A real 64x64 JPEG, so the test proves Image can decode what arrives.
+        cover = subprocess.run(
+            ['ffmpeg', '-v', 'error', '-f', 'lavfi', '-i', 'color=c=0xC81E5A:s=64x64',
+             '-frames:v', '1', '-f', 'mjpeg', '-'],
+            capture_output=True, check=True, timeout=30).stdout
+        # Same JPEG with its frame header claiming 65000x65000.
+        sof = cover.index(b'\xff\xc0')
+        huge = cover[:sof + 5] + struct.pack('>HH', 65000, 65000) + cover[sof + 9:]
+        cls.server.images = {
+            '/cover.jpg': cover, '/huge.jpg': huge, '/small.png': _png(64, 64),
+            # 8000x8000 declared, 187 KB on the wire: 256 MB once decoded.
+            '/bomb.png': _png(8000, 8000), '/text.jpg': b'<html>not an image</html>',
+        }
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+        cls.base = 'http://127.0.0.1:%d' % cls.server.server_address[1]
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+
+    def harness(self, directory, labels, extra=''):
+        source = (REPO / 'Service.qml').read_text()
+        pieces = []
+        for pattern in (r'^  function apiRequest\([^]*?^  }$',
+                        r'^  function clipStrings\([^]*?^  }$',
+                        r'^  function fetchBounded\([^]*?^  }$',
+                        r'^  function artwork\([^]*?^  }$',
+                        r'^  function loadArtwork\([^]*?^  }$',
+                        r'^  function clearArtwork\([^]*?^  }$',
+                        r'^  function base64\([^]*?^  }$',
+                        r'^  function validPeaks\([^]*?^  }$',
+                        r'^  function imageHeader\([^]*?^  }$',
+                        r'^  function expireRequests\([^]*?^  }$',
+                        r'^  function cancelRequests\([^]*?^  }$',
+                        r'^  Timer \{\n    id: requestDeadline[^]*?^  }$'):
+            match = re.search(pattern.replace('[^]', r'[\s\S]'), source, re.M)
+            self.assertIsNotNone(match, pattern)
+            pieces.append(match.group(0))
+        shutil.copy(REPO / 'PlexApi.js', directory / 'PlexApi.js')
+        (directory / 'harness.qml').write_text(textwrap.dedent('''\
+            import QtQuick
+            import "PlexApi.js" as PlexApi
+            Item {
+              id: root
+              property string serverUri: %(base)s
+              property string serverToken: "SYNTHETIC"
+              property string serverName: "fixture"
+              property string clientId: "audit"
+              property int _sessionGeneration: 0
+              readonly property int apiTimeoutMs: %(timeout)d
+              readonly property int apiMaxResponseBytes: %(cap)d
+              readonly property int apiMaxInFlightBytes: %(budget)d
+              readonly property int apiMaxStringLength: 2000
+              readonly property int artMaxBytes: %(cap)d
+              readonly property int artCacheChars: 8 * 1024 * 1024
+              readonly property int artRetryMs: 300000
+              readonly property int artMaxPixels: 2048
+              property int artRevision: 0
+              property var _art: ({})
+              property var _artOrder: []
+              property int _artChars: 0
+              property var _pendingRequests: []
+              property int outstanding: %(count)d
+              // A label is a path plus an optional "#n", so one path can be
+              // requested several times at once.
+              function report(label, started, outcome) {
+                console.log("RESULT " + JSON.stringify({ path: label, ms: Date.now() - started,
+                                                         outcome: outcome }))
+                if (--outstanding === 0) Qt.quit()
+              }
+              Component.onCompleted: {
+                var labels = %(labels)s
+                labels.forEach(function (label) {
+                  var started = Date.now()
+                  root.apiRequest("GET", label.split("#")[0], {},
+                    function (json) { root.report(label, started, "ok " + JSON.stringify(json)) },
+                    function (error) { root.report(label, started, "failed " + error) })
+                })
+              }
+            ''') % {'base': json.dumps(self.base), 'timeout': self.TIMEOUT_MS,
+                    'cap': self.MAX_BYTES, 'budget': self.MAX_IN_FLIGHT,
+                    'count': len(labels), 'labels': json.dumps(labels)}
+            + '\n\n'.join(pieces + [extra]) + '\n}\n')
+        return directory / 'harness.qml'
+
+    def run_qml(self, labels, extra=''):
+        with tempfile.TemporaryDirectory(prefix='ampbar-api-') as temp:
+            qml = self.harness(Path(temp), list(labels), extra)
+            env = dict(os.environ, QT_QPA_PLATFORM='offscreen', QT_FORCE_STDERR_LOGGING='1')
+            result = subprocess.run([shutil.which('qml6') or shutil.which('qml'), str(qml)],
+                                    env=env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return result.stdout + result.stderr
+
+    def run_requests(self, *labels):
+        output = self.run_qml(labels)
+        results = {}
+        for line in output.splitlines():
+            if 'RESULT ' in line:
+                entry = json.loads(line.split('RESULT ', 1)[1])
+                results[entry['path']] = entry
+        self.assertEqual(sorted(results), sorted(labels), output)
+        return results
+
+    def test_bounded_replies_are_parsed_and_hostile_ones_refused(self):
+        results = self.run_requests('/ok', '/declared', '/endless', '/trickle')
+        self.assertEqual(results['/ok']['outcome'], 'ok {"MediaContainer":{"size":1}}')
+        self.assertEqual(results['/declared']['outcome'], 'failed response from Plex was too large')
+        self.assertEqual(results['/endless']['outcome'], 'failed response from Plex was too large')
+        self.assertEqual(results['/trickle']['outcome'], 'failed Plex took too long to respond')
+        # The deadline is total, not idle: a steady trickle still gets cut off.
+        self.assertLess(results['/trickle']['ms'], self.TIMEOUT_MS + 1500)
+        for path in ('/declared', '/endless'):
+            self.assertLess(results[path]['ms'], self.TIMEOUT_MS)
+
+    def test_long_strings_are_clipped_before_reaching_labels(self):
+        results = self.run_requests('/long')
+        outcome = results['/long']['outcome']
+        self.assertTrue(outcome.startswith('ok '), outcome[:200])
+        container = json.loads(outcome[3:])['MediaContainer']
+        self.assertEqual(len(container['title']), 2000)
+        self.assertEqual(container['key'], '/k')
+
+    def test_replies_under_the_cap_share_one_budget(self):
+        # Four 700 KiB replies are each allowed alone, but together they pass
+        # the 2 MiB in-flight budget; whichever pushes it over is refused.
+        labels = ['/stall#%d' % i for i in range(4)]
+        results = self.run_requests(*labels)
+        outcomes = [results[label]['outcome'] for label in labels]
+        refused = [label for label in labels
+                   if results[label]['outcome'] == 'failed response from Plex was too large']
+        self.assertTrue(refused, outcomes)
+        for label in refused:
+            self.assertLess(results[label]['ms'], self.TIMEOUT_MS)
+        for label in set(labels) - set(refused):
+            self.assertEqual(results[label]['outcome'], 'failed Plex took too long to respond')
+
+    def test_sign_out_aborts_requests_in_flight(self):
+        # What clearSession() does: bump the generation, then cancel. Nothing
+        # may call back afterwards, and nothing may be left in flight.
+        output = self.run_qml(['/trickle#1', '/trickle#2'], extra=textwrap.dedent('''\
+              Timer {
+                interval: 300
+                running: true
+                onTriggered: {
+                  root._sessionGeneration++
+                  root.cancelRequests()
+                  console.log("LEFT " + root._pendingRequests.length + " " + requestDeadline.running)
+                  Qt.callLater(Qt.quit)
+                }
+              }'''))
+        self.assertIn('LEFT 0 false', output)
+        self.assertNotIn('RESULT ', output)
+
+    def test_artwork_is_bounded_and_reaches_image(self):
+        base = self.base
+        output = self.run_qml([], extra=textwrap.dedent('''\
+              property var covers: ({ good: %(good)s, endless: %(endless)s,
+                                      trickle: %(trickle)s, foreign: "http://127.0.0.2:9/x.jpg",
+                                      png: %(png)s, bomb: %(bomb)s, huge: %(huge)s, text: %(text)s })
+              Image {
+                id: shown
+                source: root.artwork(root.covers.good)
+                sourceSize.width: 48
+              }
+              Timer {
+                interval: 100
+                running: true
+                onTriggered: {
+                  for (var k in root.covers) root.artwork(root.covers[k])
+                  // RFC 4648 vectors, plus every byte value.
+                  var all = []
+                  for (var b = 0; b < 256; b++) all.push(b)
+                  var enc = function (text) {
+                    var bytes = []
+                    for (var i = 0; i < text.length; i++) bytes.push(text.charCodeAt(i))
+                    return root.base64(bytes)
+                  }
+                  console.log("B64 " + JSON.stringify([enc(""), enc("f"), enc("fo"), enc("foo"),
+                                                       enc("foob"), enc("fooba"), enc("foobar"),
+                                                       root.base64(all)]))
+                }
+              }
+              Timer {
+                interval: %(wait)d
+                running: true
+                onTriggered: {
+                  var out = {}
+                  for (var k in root.covers) out[k] = root.artwork(root.covers[k]).slice(0, 23)
+                  out.image = shown.status === Image.Ready ? shown.implicitWidth : -1
+                  out.pending = root._pendingRequests.length
+                  console.log("ART " + JSON.stringify(out))
+                  Qt.quit()
+                }
+              }''') % {'good': json.dumps(base + '/cover.jpg'), 'endless': json.dumps(base + '/endless'),
+                          'trickle': json.dumps(base + '/trickle'), 'png': json.dumps(base + '/small.png'),
+                          'bomb': json.dumps(base + '/bomb.png'), 'huge': json.dumps(base + '/huge.jpg'),
+                          'text': json.dumps(base + '/text.jpg'), 'wait': self.TIMEOUT_MS + 1500})
+        art = json.loads(output.split('ART ', 1)[1].splitlines()[0])
+        # The PNG is labelled image/jpeg by the server; the bytes decide.
+        self.assertEqual(art, {'good': 'data:image/jpeg;base64,', 'endless': '', 'trickle': '',
+                               'foreign': '', 'png': 'data:image/png;base64,i', 'bomb': '',
+                               'huge': '', 'text': '', 'image': 48, 'pending': 0}, output)
+        import base64
+        encoded = json.loads(output.split('B64 ', 1)[1].splitlines()[0])
+        expected = [base64.b64encode(v).decode() for v in
+                    (b'', b'f', b'fo', b'foo', b'foob', b'fooba', b'foobar', bytes(range(256)))]
+        self.assertEqual(encoded, expected)
+
+    def test_only_well_formed_waveforms_are_drawn(self):
+        output = self.run_qml([], extra=textwrap.dedent('''\
+              Timer {
+                interval: 1
+                running: true
+                onTriggered: {
+                  var good = []
+                  for (var i = 0; i < 120; i++) good.push(i / 119)
+                  var huge = []
+                  for (var j = 0; j < 100000; j++) huge.push(0.5)
+                  var cases = [good, good.slice(1), huge, good.map(function (v) { return v * 2 }),
+                               good.map(function (v, k) { return k === 3 ? "0.5" : v }),
+                               good.map(function (v, k) { return k === 3 ? NaN : v }), null, {}]
+                  console.log("PEAKS " + JSON.stringify(cases.map(root.validPeaks)))
+                  // SOI, then a standalone TEM marker, then a 32x16 frame header.
+                  var jpeg = [0xFF, 0xD8, 0xFF, 0x01, 0xFF, 0xC0, 0x00, 0x11, 0x08,
+                              0x00, 0x10, 0x00, 0x20, 0x03]
+                  console.log("TEM " + JSON.stringify(root.imageHeader(jpeg)))
+                  Qt.quit()
+                }
+              }'''))
+        verdicts = json.loads(output.split('PEAKS ', 1)[1].splitlines()[0])
+        self.assertEqual(verdicts, [True, False, False, False, False, False, False, False])
+        header = json.loads(output.split('TEM ', 1)[1].splitlines()[0])
+        self.assertEqual(header, {'type': 'image/jpeg', 'width': 32, 'height': 16})
+
+    def test_failed_covers_do_not_accumulate(self):
+        output = self.run_qml([], extra=textwrap.dedent('''\
+              Timer {
+                interval: 1
+                running: true
+                onTriggered: {
+                  // 1,500 covers that failed over five minutes ago, then one more.
+                  var long_ago = Date.now() - root.artRetryMs - 1000
+                  for (var i = 0; i < 1500; i++) root._art["http://gone.invalid/" + i] = { data: "", at: long_ago }
+                  root._art["http://gone.invalid/recent"] = { data: "", at: Date.now() }
+                  root.loadArtwork("http://127.0.0.2:9/foreign.jpg")
+                  console.log("KEYS " + Object.keys(root._art).length)
+                  Qt.quit()
+                }
+              }'''))
+        # The stale failures go; the recent one and the new entry stay.
+        self.assertEqual(output.split('KEYS ', 1)[1].split()[0], '2')
+
+    def test_every_label_renders_plain_text(self):
+        # Qt's default AutoText renders markup in server-supplied titles, and
+        # <img src> in a track name would fetch outside every bound here.
+        for name in ('Panel.qml', 'PlexSettings.qml', 'SeekBar.qml', 'PlexPanel.qml'):
+            lines = (REPO / name).read_text().splitlines()
+            for i, line in enumerate(lines):
+                if re.match(r'^\s*Text \{', line):
+                    with self.subTest(file=name, line=i + 1):
+                        self.assertEqual(lines[i + 1].strip(), 'textFormat: Text.PlainText')
+            for line in lines:
+                self.assertNotIn('Text.RichText', line)
+                self.assertNotIn('Text.StyledText', line)
+
+    def test_panel_never_hands_image_a_remote_url(self):
+        # Every cover in the panel must come through Service.artwork(), which
+        # is bounded; a bare network URL would go to Qt's unbounded loader.
+        panel = (REPO / 'Panel.qml').read_text()
+        sources = re.findall(r'^\s*source:.*$', panel, re.M)
+        self.assertTrue(sources)
+        for line in sources:
+            self.assertIn('artwork(', line)
+
+    def test_limits_are_fixed_in_the_service(self):
+        source = (REPO / 'Service.qml').read_text()
+        self.assertIn('readonly property int apiTimeoutMs: 30000', source)
+        self.assertIn('readonly property int apiMaxResponseBytes: 16 * 1024 * 1024', source)
+        self.assertIn('readonly property int apiMaxInFlightBytes: 32 * 1024 * 1024', source)
+        self.assertIn('xhr.responseType = "arraybuffer"', source)
+        self.assertIn('readonly property int artMaxBytes: 2 * 1024 * 1024', source)
+        # Sign-out and teardown must both abort whatever is still in flight.
+        for block in (r'^  function clearSession\(\) \{[\s\S]*?^  }$',
+                      r'^  Component\.onDestruction: \{[\s\S]*?^  }$'):
+            match = re.search(block, source, re.M)
+            self.assertIsNotNone(match, block)
+            self.assertIn('cancelRequests()', match.group(0))
+        teardown = re.search(r'^  Component\.onDestruction: \{[\s\S]*?^  }$', source, re.M).group(0)
+        self.assertIn('authProcess.signal(15)', teardown)
+        self.assertIn('serverProcess.signal(15)', teardown)
+
+
+class InstallTests(unittest.TestCase):
+    def test_every_helper_is_installed(self):
+        # install.sh names the helpers so that a stray bin/__pycache__ can't
+        # stop it, which means a new helper has to be added there by hand.
+        script = (REPO / 'install.sh').read_text()
+        helpers = [path.name for path in (REPO / 'bin').iterdir()
+                   if path.is_file() and os.access(path, os.X_OK)]
+        self.assertTrue(helpers)
+        for name in helpers:
+            self.assertIn(f'"$SRC/bin/{name}"', script, f'install.sh does not ship bin/{name}')
 
 
 if __name__ == '__main__':

@@ -81,7 +81,7 @@ class EngineLifecycleTests(unittest.TestCase):
         try:
             probe.bind(str(self.runtime / "probe.sock"))
         except PermissionError:
-            self.skipTest("sandbox blocks private Unix socket binding")
+            self.fail("sandbox blocks private Unix socket binding")
         finally:
             probe.close()
         (self.runtime / "probe.sock").unlink()
@@ -268,6 +268,27 @@ class EngineLifecycleTests(unittest.TestCase):
         self.assertEqual(victim.read_text(), "unchanged")
         self.assertEqual(self.players(), [])
 
+    def test_check_vouches_only_for_a_live_player_socket(self):
+        # The shell attaches at startup only when check exits 0.
+        self.assertNotEqual(self.run_engine("check").returncode, 0)  # nothing there
+        with socket.socket(socket.AF_UNIX) as stale:
+            stale.bind(str(self.target))
+        self.assertNotEqual(self.run_engine("check").returncode, 0)  # not listening
+        self.target.unlink()
+        self.target.write_text("not a socket")
+        self.assertNotEqual(self.run_engine("check").returncode, 0)
+        self.target.unlink()
+        victim = self.root / "victim.sock"
+        with socket.socket(socket.AF_UNIX) as elsewhere:
+            elsewhere.bind(str(victim))
+            elsewhere.listen()
+            self.target.symlink_to(victim)
+            self.assertNotEqual(self.run_engine("check").returncode, 0)
+        self.target.unlink()
+        self.assert_started()
+        result = self.run_engine("check")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_unsafe_lock_is_refused_without_modifying_target(self):
         victim = self.root / "victim"
         victim.write_text("unchanged")
@@ -279,8 +300,8 @@ class EngineLifecycleTests(unittest.TestCase):
         self.assertEqual(victim.stat().st_mode & 0o777, 0o640)
         self.assertEqual(self.players(), [])
 
-    @unittest.skipUnless(REAL_MPV, "mpv is not installed")
     def test_real_mpv_plays_local_silence_through_launcher_exit(self):
+        self.assertTrue(REAL_MPV, "this test needs mpv")
         self.fake.write_text("#!/usr/bin/env python3\n"
                              "import os, sys\n"
                              f"os.execv({REAL_MPV!r}, [{REAL_MPV!r}, '--ao=null'] + sys.argv[1:])\n")

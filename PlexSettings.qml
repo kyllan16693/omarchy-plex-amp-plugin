@@ -176,6 +176,7 @@ PanelWindow {
           spacing: Style.space(8)
 
           Text {
+            textFormat: Text.PlainText
             Layout.fillWidth: true
             text: "Ampbar for Plex settings"
             color: root.foreground
@@ -184,6 +185,7 @@ PanelWindow {
           }
 
           Text {
+            textFormat: Text.PlainText
             text: "Esc"
             color: root.dimmer
             font.family: root.fontFamily
@@ -212,6 +214,7 @@ PanelWindow {
         }
 
         Text {
+          textFormat: Text.PlainText
           Layout.fillWidth: true
           text: {
             if (!root.plex) return ""
@@ -366,6 +369,7 @@ PanelWindow {
         }
 
         Text {
+          textFormat: Text.PlainText
           Layout.fillWidth: true
           text: "jk move   ↵ change   Esc close"
           color: root.dimmer
